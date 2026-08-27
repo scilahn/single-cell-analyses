@@ -1,9 +1,6 @@
 # Single-cell analyses
 
-Two independent single-cell disease analyses, each self-contained in its own folder. Both
-ask the same shape of question — which cell types are perturbed in disease versus control,
-and what the perturbation actually is — against different tissues, technologies, and
-analysis stacks.
+This is a repo of re-analyses of published sc/snRNA-seq datasets by indication.
 
 ## `endometriosis/`
 
