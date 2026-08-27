@@ -1,0 +1,2430 @@
+---
+title: "Cell-type perturbation in MASH vs healthy liver"
+author: "Richard Ahn, PhD"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+    code-fold: show
+    theme: cosmo
+    df-print: paged
+execute:
+  warning: false
+  message: false
+engine: knitr
+---
+
+```{r}
+#| label: setup
+#| code-fold: show
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(speckle)     # propeller: donor-level differential abundance
+  library(DESeq2)      # pseudobulk differential expression
+  library(fgsea)       # GSEA on the ranked DE statistics
+  library(msigdbr)     # MSigDB Hallmark gene sets
+  library(knitr)
+})
+
+set.seed(1234)
+
+# Format p-values for inline prose. signif() alone yields values like 1.3e-07,
+# which the inline hook renders as broken superscript markup.
+fmt_p <- function(x) {
+  x <- unname(x[1])
+  if (is.na(x)) return("NA")
+  if (x < 1e-3) formatC(x, format = "e", digits = 1) else formatC(signif(x, 2), format = "g")
+}
+
+CACHE_DIR <- "cache"
+dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
+cache_path <- function(name) file.path(CACHE_DIR, name)
+
+# Compute-or-load guard. Expensive steps that touch the full object write a
+# small intermediate to cache/ and reuse it on later renders. Deleting cache/
+# forces a full cold run, so the document stays reproducible from the raw data.
+cached <- function(name, expr) {
+  p <- cache_path(name)
+  if (file.exists(p)) return(readRDS(p))
+  x <- force(expr)
+  saveRDS(x, p)
+  x
+}
+
+# COL1A1 counts for every nucleus, needed in two separate sections. Wrapped in a
+# function so neither section depends on the other having run first.
+col1a1_counts <- function() cached("col1a1_distribution.rds", {
+  library(BPCells)
+  as.vector(as.matrix(open_matrix_dir("bpcells_counts")["COL1A1", ]))
+})
+```
+
+## Introduction
+
+The prompt is to take a MASH scRNA-seq or snRNA-seq dataset and highlight which cell types are
+most perturbed and how relative to healthy liver. I think "most perturbed" carries two
+distinct meanings:
+
+1. **Differential abundance.** Which cell types change in proportion between MASH and
+   control. A cell type can be strongly perturbed here while its surviving
+   cells look transcriptionally ordinary.
+2. **Within-cell-type differential expression.** How the cells of a given type are
+   transcriptionally rewired in disease. A cell type can hold steady in
+   proportion while its program shifts substantially.
+
+These are measured separately below and only combined at the end, in a ranked
+table that answers the prompt on both axes.
+
+The cohort is staged rather than binary: healthy control, isolated steatosis
+(MASL), early MASH and advanced MASH. The primary comparison is the clean
+case-control contrast of control against MASH, with MASL held out so that
+cases with steatosis but no steatohepatitis do not dilute it. MASL is then put
+back to work in two secondary views: an ordered trend across all four stages,
+and stage-adjacent contrasts that localize where along the progression each
+cell type actually changes. A cell type that shifts only between early and
+advanced MASH is telling a different story from one that shifts at the onset
+of steatosis, and the two-group contrast alone cannot distinguish them.
+
+I made the decision to run **analyses at the
+donor level, not the cell level.** A dataset of a quarter of a million nuclei from 48 people
+now carries 48 independent observations, not 250,000. Abundance is therefore tested on donor-level proportions, and
+expression on donor-level pseudobulk.
+
+I used Claude Code Opus 5 for this report.
+
+## Executive summary
+
+**Hepatocytes are the most perturbed cell type, and the only one perturbed on
+both axes.** They lose more than half their share of nuclei across the
+progression from control to MASH, and those nuclei carry more differentially expressed genes than
+any other cell type by a wide margin. The program is coherent: p53 and growth
+arrest up, differentiated metabolic function down, with bile acid, xenobiotic
+and fatty acid metabolism all depleted. The compositional result independently
+reproduces the source paper's headline.
+
+**Endothelial cells do not change in abundance at all**, yet
+carry the second-largest expression program in the dataset, and its content is
+inflammatory activation. T cells expand several-fold in
+number while changing their expression program comparatively little.
+
+**Macrophages change identity rather than number,** switching from the resident
+Kupffer program to a lipid-handling, scar-associated one. This is the most
+mechanistically specific result here, and it reproduces the
+macrophage arm of the fibrotic niche described in cirrhosis by Ramachandran et
+al., in a cohort that has not reached cirrhosis.
+
+**Two results required correcting the deposited annotation rather than trusting
+it.** A subcluster labeled as inactivated stellate cells is vascular mural
+tissue, which inverts the apparent direction of the stellate contractile
+program when the label is aggregated. And stellate abundance appears unchanged
+in the two-group contrast because it is not monotonic: the compartment expands
+only at advanced fibrosis, which a control-versus-MASH comparison cancels out.
+
+**What this dataset cannot answer.** It does not contain collagen-producing
+myofibroblasts, and two of the three scar-associated populations from the
+reference cirrhosis atlas are absent while the one not embedded in scar
+replicates cleanly. I think the explanation is that needle-core biopsy
+tissue does not recover cells resident in dense matrix. The consequence is nothing here bears on myofibroblast biology in either direction, and the flat collagen result is a sampling limit rather than evidence against
+fibrogenesis.
+
+**Implications for therapeutics are limited to target engageability.** The
+receptors for thyromimetic, FXR and PPAR-alpha agonism are well expressed in the
+cell types those drugs act on, and the programs they regulate are among the
+things disease has disturbed. GLP-1 and GIP receptors are not expressed in this
+tissue, so a liver atlas is the wrong instrument for those agents. However, the glucagon
+arm of a dual agonist is the exception, with a direct and measurable hepatocyte
+target. Anti-fibrotic targets cannot be assessed, for the sampling reason
+above. None of this speaks to potential efficacy.
+
+## Data provenance
+
+Single-nucleus RNA-seq of 48 human liver biopsies spanning the MASLD spectrum,
+from Hong et al., *Nature Genetics* 2025. Raw data are deposited under GEO
+GSE289173 (BioProject PRJNA1221860); the processed Seurat object analyzed here
+is distributed via Zenodo (10.5281/zenodo.14586466, CC-BY 4.0).
+
+### Why this dataset
+
+Several candidate datasets were considered before settling on this one (see table below). I chose the Hong et al. dataset because it is snRNA-seq, includes MASH and control samples from human liver biopsies, has a sufficient number of donors and nuclei, and, decisively, because its processed data was verified as downloadable rather than merely deposited.
+
+::: {.column-page}
+
+| #   | Dataset (accession)                                               | Human         | Liver biopsy | Indication            | sc / sn       | Atlas         | Download verified?                                                           |
+| --- | ----------------------------------------------------------------- | ------------- | ------------ | --------------------- | ------------- | ------------- | ---------------------------------------------------------------------------- |
+| 1   | sc-eQTL MASH, Hong 2025 (GSE289173 / Zenodo 14586466)             | Yes           | Yes          | MASH + control        | sn            | No (cohort)   | **Yes — processed Seurat v4 on Zenodo, CC-BY, 6.6 GB, opened and confirmed** |
+| 2   | EphB2 NASH transition, Xiao 2023 (GSE189600)                      | Yes (+ mouse) | Yes          | NAFL→NASH             | sn (+ snATAC) | No            | Strongly — independently re-downloaded from GEO by ≥3 later papers           |
+| 3   | Spatial multi-omics MASLD atlas, NatGen 2025 (s41588-025-02407-8) | Yes           | Yes          | control / MASL / MASH | both          | Yes           | Not yet — accession not confirmed                                            |
+| 4   | Human HSC multi-omics, J Hepatol 2024 (S0168-8278(24)02667-9)     | Yes           | Yes          | normal / MASL / MASH  | sn (+ snATAC) | No (HSC-only) | Not yet — accession not confirmed                                            |
+| 5   | Human snRNA-seq MASH (GSE212837)                                  | Yes           | Yes          | MASH                  | sn            | No            | Deposited + reused; file listing not opened                                  |
+| 6   | Human scRNA-seq MASH (GSE189175)                                  | Yes           | Yes          | MASH                  | sc            | No            | Deposited + reused; file listing not opened                                  |
+| —   | Copenhagen NASH, Fred 2022                                        | Yes           | Yes          | NASH                  | sc            | No            | **Excluded — no raw data released, no healthy controls**                     |
+
+:::
+
+The Hong et al. study is primarily a single-cell eQTL analysis, and its headline result is
+a hepatocyte maladaptation signal at *EFHD1*/*FOXO1*. The cell-type
+perturbation question asked here is described in that paper but not developed
+in depth, and its differential expression was run cell-level with Seurat
+`FindMarkers`. The contribution of this report is to answer the perturbation
+question directly, with donor-level replication on both axes.
+
+The downloadable object was built with Cellranger, Cellbender for ambient RNA,
+DoubletFinder for doublets, Liger for integration and Seurat for clustering.
+Liger was not an arbitrary choice: the authors benchmarked it against FastMNN,
+Harmony, CCA and RPCA on kBET acceptance rate and selected it on that basis.
+Normalization was done with `scran` and `batchelor` rather than Seurat's
+log-normalization.
+This analysis reuses that object and its integration as-is, and
+validates the annotations rather than re-deriving them. 
+
+### Cohort, contrasts and marker panels
+
+The Zenodo deposit ships tidied metadata: seven columns, with disease stage
+already in current MASLD/MASH nomenclature rather than the pre-2023 NAFLD terms
+used in the authors' analysis scripts. No remapping is needed.
+
+Two annotation columns are supplied. `Cell_type_broad` gives 14 labels;
+`Cell_type_detailed` gives 19, and nests cleanly inside the broad column. Only
+two lineages subdivide, and both subdivide along exactly the axis MASH acts on:
+hepatocytes split by zonation, stellate cells by activation state. That is used
+below, after the primary analysis, to ask where within a lineage the
+perturbation sits.
+
+```{r}
+#| label: constants
+#| code-fold: show
+
+# Metadata columns, confirmed against the object rather than assumed.
+COL_DONOR    <- "DonorID"
+COL_STAGE    <- "Disease_group"
+COL_CT_BROAD <- "Cell_type_broad"
+COL_CT_FINE  <- "Cell_type_detailed"
+
+# Disease stage, in the order of progression.
+STAGE_LEVELS <- c("control", "MASL", "eMASH", "aMASH")
+STAGE_LABELS <- c(control = "No-MASLD", MASL = "MASL",
+                  eMASH = "eMASH", aMASH = "aMASH")
+
+# Primary contrast is two-group. MASL is the intermediate stage and is held out
+# of it, so the headline case-control comparison is not diluted by cases that
+# have steatosis without steatohepatitis. MASL is not discarded: it carries the
+# ordered trend analysis and the stage-adjacent contrasts defined below.
+CONDITION_MAP <- c(control = "Control", MASL = NA,
+                   eMASH = "MASH", aMASH = "MASH")
+CONDITION_LEVELS <- c("Control", "MASH")
+
+# Secondary stage-wise contrasts, run after the primary. Each is a step along
+# the progression, which localizes where in the disease course a cell type
+# changes rather than only whether it differs at the endpoint.
+STAGE_CONTRASTS <- list(
+  c("control", "MASL"),   # onset of steatosis
+  c("MASL",    "eMASH"),  # steatosis to steatohepatitis
+  c("control", "eMASH"),  # control to early MASH
+  c("eMASH",   "aMASH"),  # early to advanced fibrosis
+  c("control", "aMASH")   # full span, largest expected effect
+)
+
+# Thresholds for calling a gene differentially expressed. Significance alone
+# admits very small effects when donor numbers are adequate, so an effect-size
+# floor is applied alongside it. Both are stated wherever counts are reported.
+FDR_CUTOFF <- 0.05
+LFC_CUTOFF <- 0.25
+
+# Applied to every DESeq2 result table in this report.
+is_de <- function(r) {
+  !is.na(r$padj) & r$padj < FDR_CUTOFF & abs(r$log2FoldChange) >= LFC_CUTOFF
+}
+DE_RULE <- paste0("FDR < ", FDR_CUTOFF, " and |log2FC| >= ", LFC_CUTOFF)
+
+# Not cell types. Per the source paper's supplementary methods, "Unidentified"
+# marks cells whose substate assignment disagreed between the joint and the
+# disease-stratified subclustering. Excluded from every analysis below.
+DROP_LABELS <- c("Suspected_doublet", "Unidentified")
+
+# Canonical human liver markers, used to verify the shipped annotations before
+# any claim is built on them.
+LIVER_MARKERS <- list(
+  Hepatocyte    = c("ALB", "APOA1", "TTR", "CYP2E1", "HNF4A", "ASGR1"),
+  Cholangiocyte = c("KRT19", "KRT7", "EPCAM", "SOX9", "CFTR"),
+  Stellate      = c("COL1A1", "COL3A1", "DCN", "PDGFRB", "RGS5"),
+  Endothelial   = c("PECAM1", "VWF", "CLEC4G", "STAB2", "LYVE1"),
+  Kupffer_Mac   = c("CD68", "MARCO", "VSIG4", "C1QA", "CD5L"),
+  Scar_Mac      = c("TREM2", "CD9", "GPNMB", "SPP1", "LYZ"),
+  T_cell        = c("CD3D", "CD3E", "CD8A", "IL7R"),
+  NK            = c("NKG7", "GNLY", "KLRD1"),
+  B_Plasma      = c("CD79A", "MS4A1", "MZB1", "IGHG1")
+)
+
+# programs the differential expression results are checked against. These are
+# recovered from the data, not asserted; they exist here to make the check
+# explicit rather than post hoc.
+MASH_PROGRAMS <- list(
+  HSC_activation      = c("COL1A1", "COL3A1", "ACTA2", "TIMP1", "TAGLN"),
+  Scar_macrophage     = c("TREM2", "CD9", "GPNMB", "SPP1"),
+  Kupffer_homeostatic = c("MARCO", "VSIG4", "CD5L", "CLEC4F"),
+  LSEC_identity       = c("CLEC4G", "STAB2", "LYVE1", "OIT3"),
+  Ductular_reaction   = c("KRT19", "KRT7", "SOX9", "EPCAM")
+)
+```
+
+## Loading the object
+
+The deposited object is Seurat v4 and occupies roughly 14 GB once loaded, which
+leaves no headroom on a 16 GB machine. That shapes the code below, especially the decision to run on-disk using BPCells.
+
+Everything expensive runs once, writes a compact intermediate to `cache/`, and
+is reused afterwards. Counts are additionally written to an on-disk BPCells
+matrix, so per-cell-type aggregation streams from disk instead of holding a
+24,615 x 249,233 sparse matrix in RAM. Deleting `cache/` and `bpcells_counts/`
+forces a full recomputation from the deposited file.
+
+```{r}
+#| label: heavy-pass
+#| code-fold: show
+
+RDS <- "data/unzipped/Zenodo/processed_seurat_object/MASLD_snRNA_seq_seurat_v4.rds"
+
+if (!file.exists(cache_path("meta.rds")) || !dir.exists("bpcells_counts")) {
+  library(BPCells)
+  mem.maxVSize(vsize = 64000)          # allow the load to spill past physical RAM
+  obj <- readRDS(RDS)
+  rna <- obj@assays$RNA
+
+  saveRDS(obj@meta.data, cache_path("meta.rds"))
+  saveRDS(list(dim = dim(obj), reductions = names(obj@reductions),
+               genes = rownames(rna), seurat_ver = as.character(obj@version)),
+          cache_path("obj_info.rds"))
+  for (rd in names(obj@reductions)) {
+    e <- obj@reductions[[rd]]@cell.embeddings
+    saveRDS(e[, 1:min(3, ncol(e))], cache_path(paste0("emb_", rd, ".rds")))
+  }
+
+  cnt <- rna@counts                     # raw integer counts, required for pseudobulk
+  rm(obj, rna); gc()
+  BPCells::write_matrix_dir(cnt, dir = "bpcells_counts", compress = TRUE)
+  rm(cnt); gc()
+}
+
+md   <- readRDS(cache_path("meta.rds"))
+info <- readRDS(cache_path("obj_info.rds"))
+
+md$stage     <- factor(md[[COL_STAGE]], levels = STAGE_LEVELS,
+                       labels = STAGE_LABELS[STAGE_LEVELS])
+md$condition <- factor(unname(CONDITION_MAP[as.character(md[[COL_STAGE]])]),
+                       levels = CONDITION_LEVELS)
+
+# Technical labels are not cell types and are excluded from every analysis.
+n_dropped <- sum(md[[COL_CT_BROAD]] %in% DROP_LABELS)
+md <- md[!md[[COL_CT_BROAD]] %in% DROP_LABELS, ]
+```
+
+The object holds `r format(info$dim[2], big.mark = ",")` nuclei and
+`r format(info$dim[1], big.mark = ",")` genes, integrated with Liger
+(reductions: `r paste(info$reductions, collapse = ", ")`). Dropping
+`r paste(DROP_LABELS, collapse = " and ")` removes
+`r format(n_dropped, big.mark = ",")` nuclei, leaving
+`r format(nrow(md), big.mark = ",")` for analysis.
+
+## Cohort
+
+```{r}
+#| label: cohort
+
+donors <- unique(md[, c(COL_DONOR, "stage", "condition")])
+names(donors)[1] <- "donor"
+
+cohort <- as.data.frame(table(Stage = donors$stage), responseName = "Donors")
+cohort$Nuclei <- as.integer(table(factor(md$stage, levels = levels(donors$stage))))
+cohort$`Median nuclei/donor` <- round(tapply(
+  as.integer(table(md[[COL_DONOR]]))[donors$donor], donors$stage, median))
+cohort$`Primary contrast` <- ifelse(
+  is.na(CONDITION_MAP[STAGE_LEVELS]), "held out",
+  as.character(CONDITION_MAP[STAGE_LEVELS]))
+kable(cohort, caption = "Cohort by disease stage.")
+```
+
+`r nrow(donors)` donors, distributed as
+`r paste(sprintf("%s n=%d", cohort$Stage, cohort$Donors), collapse = ", ")`.
+This reproduces the cohort reported in the source paper exactly.
+
+Note that the stages are not balanced in nuclei: controls contribute
+`r round(100 * sum(md$stage == "No-MASLD") / nrow(md))`% of nuclei but only
+`r round(100 * sum(donors$stage == "No-MASLD") / nrow(donors))`% of donors.
+Pooling nuclei across donors would therefore weight the control group nearly
+twice as heavily as its donor count warrants, which is the first practical
+reason the analyses below operate on per-donor quantities.
+
+One further detail matters for anyone reusing this object: donor identifiers do
+not encode disease stage. All 20 `ctrl_*` donors are controls, but three further
+controls are named `FL*`. Condition must be taken from `r COL_STAGE`, never
+parsed from the donor name.
+
+```{r}
+#| label: naming-check
+kable(table(`Donor name` = ifelse(grepl("^ctrl", donors$donor), "ctrl_*", "FL*"),
+            Stage = donors$stage),
+      caption = "Donor naming does not track disease stage.")
+```
+
+## QC and study design checks
+
+This is validation of a processed object, not re-derivation. The object has
+already been through Cellbender ambient-RNA removal and DoubletFinder. The
+question is whether anything about its quality differs systematically between
+conditions in a way that could masquerade as biology.
+
+```{r}
+#| label: qc
+#| fig-width: 10
+#| fig-height: 3.4
+
+qc <- tidyr::pivot_longer(
+  md[, c("condition", "stage", "nCount_RNA", "nFeature_RNA", "percent.mt")],
+  cols = c(nCount_RNA, nFeature_RNA, percent.mt),
+  names_to = "metric", values_to = "value")
+
+ggplot(subset(qc, !is.na(condition)), aes(condition, value, fill = condition)) +
+  geom_violin(scale = "width", linewidth = 0.3) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, linewidth = 0.3, fill = "white") +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_y_continuous(trans = "log1p") +
+  scale_fill_manual(values = c(Control = "#4C72B0", MASH = "#C44E52")) +
+  labs(x = NULL, y = "value (log1p scale)") +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+```
+
+For reference, the filters already applied by the source study, from its
+supplementary methods: singlets were retained on gene and read count with a
+per-donor threshold (count greater than 0.2 times that donor's median) and genes
+expressed in fewer than 0.25% of cells in a donor were removed. At sample level,
+donors with a median below 200 genes per cell were excluded, along with one
+principal-component outlier and three samples failing genome-transcriptome
+concordance. Ambient RNA was removed with Cellbender and doublets with
+DoubletFinder before any of that. The checks below are therefore validation of
+an already-filtered object, not a second round of filtering.
+
+`percent.mt` is essentially zero across the dataset (median
+`r round(median(md$percent.mt), 3)`, maximum
+`r round(max(md$percent.mt), 1)`%). That is the expected behavior for
+single-nucleus data, where mitochondrial transcripts are largely excluded with
+the cytoplasm. Mitochondrial filtering is not a meaningful QC axis here, and
+applying a conventional 5-10% threshold wouldn't really be meaningful.
+
+Depth differs modestly between conditions, which is worth knowing but is handled
+downstream: pseudobulk DE models library size explicitly through DESeq2's size
+factors, and proportions are depth-invariant by construction.
+
+### Confounding
+
+The design can only adjust for variables that vary *within* condition. Two
+checks decide the model formula.
+
+```{r}
+#| label: confounds
+
+# Does any donor contribute more than one condition?
+per_donor <- table(md[[COL_DONOR]], md[[COL_STAGE]])
+multi <- sum(rowSums(per_donor > 0) > 1)
+
+meta_cols <- colnames(readRDS(cache_path("meta.rds")))
+
+data.frame(
+  Check = c("Metadata columns deposited",
+            "Donors contributing >1 disease stage",
+            "Batch / chemistry / center variable present"),
+  Result = c(paste(meta_cols, collapse = ", "),
+             as.character(multi),
+             "none")
+) |> kable(caption = "Design checks determining the DE formula.")
+```
+
+Every donor contributes exactly one disease stage, so **donor is nested within
+condition**. It therefore cannot enter the design: a donor term would absorb the
+between-donor variation that *is* the condition effect. This is a correctness
+constraint rather than a modeling preference.
+
+The deposited metadata carries no batch, chemistry, sequencing-run or center
+variable. There is consequently nothing to adjust for, and the design stays
+`~ condition`. This is a single-center Korean cohort, so the risk of hidden
+batch-condition confounding is lower than in a multi-dataset atlas.
+
+## Verifying annotations
+
+Every claim below rests on the deposited labels, so they are checked against
+canonical liver markers before use. Expression is summarized per cell type from
+the on-disk counts: library-size normalized to 10,000, `log1p` transformed.
+
+```{r}
+#| label: markers
+#| fig-width: 10
+#| fig-height: 5.5
+
+mk <- cached("markers_broad.rds", {
+  library(BPCells)
+  mat  <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  keep <- !meta[[COL_CT_BROAD]] %in% DROP_LABELS
+  ct   <- factor(as.character(meta[[COL_CT_BROAD]])[keep])
+  sub  <- mat[, which(keep)]
+  normed <- log1p(multiply_cols(sub, 1e4 / colSums(sub)))
+  genes  <- intersect(unique(unlist(LIVER_MARKERS)), rownames(mat))
+  avg <- pseudobulk_matrix(normed[genes, ], cell_groups = ct, method = "mean")
+  nz  <- pseudobulk_matrix(sub[genes, ],    cell_groups = ct, method = "nonzeros")
+  pct <- sweep(nz, 2, as.integer(table(ct)), "/") * 100
+  flat <- utils::stack(LIVER_MARKERS)
+  data.frame(gene = rep(rownames(avg), ncol(avg)),
+             cell_type = rep(colnames(avg), each = nrow(avg)),
+             avg_exp = as.vector(avg), pct_exp = as.vector(pct),
+             panel = as.character(flat$ind[match(rep(rownames(avg), ncol(avg)),
+                                                 flat$values)]))
+})
+
+# Scale each gene across cell types so the dotplot shows specificity, not
+# absolute abundance: a gene high everywhere is not evidence for any label.
+mk <- mk |>
+  group_by(gene) |>
+  mutate(z = as.numeric(scale(avg_exp))) |>
+  ungroup()
+mk$gene      <- factor(mk$gene, levels = intersect(unlist(LIVER_MARKERS), mk$gene))
+mk$cell_type <- factor(mk$cell_type, levels = rev(sort(unique(mk$cell_type))))
+
+ggplot(mk, aes(gene, cell_type)) +
+  geom_point(aes(size = pct_exp, colour = z)) +
+  scale_colour_gradient2(low = "#3B4CC0", mid = "grey92", high = "#B40426",
+                         midpoint = 0, name = "scaled\nexpression") +
+  scale_size_continuous(range = c(0.2, 5), name = "% expressing") +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid.major = element_line(linewidth = 0.2))
+```
+
+Each label expresses its canonical markers: hepatocytes *ALB*, *ASGR1*,
+*CYP2E1*, *HNF4A*; endothelial cells the sinusoidal program *STAB2*,
+*CLEC4G*, *LYVE1*; stellate cells *DCN*, *COL3A1*, *PDGFRB*; macrophages the
+Kupffer set *MARCO*, *VSIG4*, *CD5L*; and the lymphoid labels their respective
+*CD3*, *KLRD1*/*GNLY* and *MS4A1*/*CD79A* markers.
+
+Two labels warrant an explicit note. Monocytes score highest for *PECAM1*, which
+initially looks like endothelial contamination. It is not: *PECAM1* is CD31,
+genuinely expressed on monocytes, and the population carries monocyte-restricted
+*FCN1* and *CSF1R* while lacking the endothelial-restricted *VWF* and *EGFL7*.
+Dendritic cells likewise carry *FLT3*, *IRF8* and *CD1C*. Both labels are sound.
+They are nonetheless the two smallest populations
+(`r format(sum(md[[COL_CT_BROAD]] == "Monocyte"), big.mark = ",")` and
+`r format(sum(md[[COL_CT_BROAD]] == "DC"), big.mark = ",")` nuclei), which
+limits them later on power grounds rather than on annotation quality.
+
+`Other_T` and `Stellate_cell_misc` are heterogeneous residual labels. They are
+retained so that proportions sum over the whole tissue, but no biological
+conclusion is drawn from their expression results.
+
+### The detailed labels
+
+The deposit also ships a finer annotation, which subdivides only two lineages:
+hepatocytes by zonation and stellate cells by state. The same marker panel is
+applied to it.
+
+```{r}
+#| label: markers-detailed
+#| fig-width: 10
+#| fig-height: 6
+
+mk_fine <- cached("markers_detailed.rds", {
+  library(BPCells)
+  mat  <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  keep <- !meta[[COL_CT_FINE]] %in% DROP_LABELS
+  ctf  <- factor(as.character(meta[[COL_CT_FINE]])[keep])
+  sub  <- mat[, which(keep)]
+  normed <- log1p(multiply_cols(sub, 1e4 / colSums(sub)))
+  genes  <- intersect(unique(unlist(LIVER_MARKERS)), rownames(mat))
+  avg <- pseudobulk_matrix(normed[genes, ], cell_groups = ctf, method = "mean")
+  nz  <- pseudobulk_matrix(sub[genes, ],    cell_groups = ctf, method = "nonzeros")
+  pct <- sweep(nz, 2, as.integer(table(ctf)), "/") * 100
+  data.frame(gene = rep(rownames(avg), ncol(avg)),
+             cell_type = rep(colnames(avg), each = nrow(avg)),
+             avg_exp = as.vector(avg), pct_exp = as.vector(pct))
+})
+
+mk_fine <- mk_fine |> group_by(gene) |>
+  mutate(z = as.numeric(scale(avg_exp))) |> ungroup()
+mk_fine$gene <- factor(mk_fine$gene, levels = intersect(unlist(LIVER_MARKERS), mk_fine$gene))
+mk_fine$cell_type <- factor(mk_fine$cell_type, levels = rev(sort(unique(mk_fine$cell_type))))
+
+ggplot(mk_fine, aes(gene, cell_type)) +
+  geom_point(aes(size = pct_exp, colour = z)) +
+  scale_colour_gradient2(low = "#3B4CC0", mid = "grey92", high = "#B40426",
+                         midpoint = 0, name = "scaled\nexpression") +
+  scale_size_continuous(range = c(0.2, 5), name = "% expressing") +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid.major = element_line(linewidth = 0.2))
+```
+
+The three hepatocyte zones share the hepatocyte marker profile, as they should:
+zonation is a gradient within a lineage, not a change of identity. The stellate
+substates mostly share the stellate profile.
+
+One does not, and it matters for how the stellate results are read.
+
+```{r}
+#| label: mural-check
+
+sub_expr <- cached("stellate_subtype_expr.rds", {
+  library(BPCells)
+  mat  <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  sel  <- grepl("^Stellate", meta[[COL_CT_FINE]])
+  ctf  <- factor(as.character(meta[[COL_CT_FINE]])[sel])
+  sb   <- mat[, which(sel)]
+  nm   <- log1p(multiply_cols(sb, 1e4 / colSums(sb)))
+  g <- c("DCN", "RBP1", "LRAT", "CYGB", "HGF", "COL1A1", "COL1A2",
+         "PDGFRB", "TAGLN", "ACTA2", "PPARG",
+         "MYH11", "MYLK", "MYL9", "NOTCH3", "RGS5")
+  g <- g[g %in% rownames(mat)]
+  t(pseudobulk_matrix(nm[g, ], cell_groups = ctf, method = "mean"))
+})
+rownames(sub_expr) <- sub("Stellate_cell_", "", rownames(sub_expr))
+
+kable(round(sub_expr[, c("LRAT", "DCN", "RBP1", "ACTA2", "TAGLN",
+                         "MYH11", "NOTCH3", "RGS5")], 2),
+      caption = "Stellate subclusters. Left: hepatic stellate identity. Right: smooth-muscle and pericyte genes.")
+```
+
+The subcluster labeled `Stellate_cell_inactivated` carries
+`r round(sub_expr["inactivated", "MYH11"] / max(sub_expr[rownames(sub_expr) != "inactivated", "MYH11"]))`-fold
+more *MYH11* than any other stellate subcluster, plus the only appreciable
+*NOTCH3*, while holding the **lowest** *LRAT* and *DCN* of the four. *MYH11* is
+smooth-muscle myosin heavy chain and is not expressed by hepatic stellate cells
+in any activation state, and a genuinely inactivated stellate cell that has
+reverted after activation retains its lipid-storing identity markers. This
+population has neither.
+
+It is therefore better described as vascular smooth muscle or pericyte than as a
+stellate cell of any state, and it is treated that way in the detailed
+differential expression below, **where it is relabeled `Mural_VSMC`**. The
+consequences of the mislabel for the aggregate stellate results are worked
+through in the supplementary material.
+
+### Testing for myofibroblasts
+
+**No myofibroblast population is recovered, which bounds every fibrosis claim.**
+*TREM2* is effectively undetected here despite being present in the object, and
+the fibrillar collagens do not move significantly in stellate cells. It would be
+easy to attribute both to single-nucleus chemistry. For *TREM2* that is
+reasonable. For the collagens it is not, and the distinction matters enough to
+test rather than assume.
+
+```{r}
+#| label: snrna-sensitivity
+
+detect <- cached("snrna_detection.rds", {
+  library(BPCells)
+  mt   <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  sel  <- meta[[COL_CT_BROAD]] == "Stellate_cell"
+  sb   <- mt[, which(sel)]
+  one  <- rep("all", ncol(sb))
+  nz   <- as.vector(pseudobulk_matrix(sb, cell_groups = one, method = "nonzeros"))
+  su   <- as.vector(pseudobulk_matrix(sb, cell_groups = one, method = "sum"))
+  tot  <- colSums(sb)
+  list(tab = data.frame(gene = rownames(sb), pct = nz / ncol(sb) * 100,
+                        cpm = su / sum(su) * 1e6),
+       n_cells = ncol(sb), median_umi = median(tot))
+})
+
+col_dist <- col1a1_counts()
+
+d <- detect$tab; d$rank <- rank(-d$cpm)
+g <- c("COL3A1", "COL1A2", "COL1A1", "COL4A1", "FN1")
+i <- match(g, d$gene)
+
+# Detection expected from sequencing depth alone, if counts were Poisson.
+expected <- (1 - exp(-d$cpm[i] * detect$median_umi / 1e6)) * 100
+
+kable(data.frame(
+  Gene = g,
+  CPM = round(d$cpm[i]),
+  `Rank of 24,615` = round(d$rank[i]),
+  `% nuclei detected` = round(d$pct[i], 1),
+  `% expected from depth` = round(expected, 1),
+  check.names = FALSE), row.names = FALSE,
+  caption = "Observed detection in stellate nuclei against what sequencing depth alone predicts.")
+```
+
+Observed detection tracks the depth expectation closely for every collagen
+tested, so there is no evidence of selective loss of this transcript class.
+*COL3A1* is the
+`r round(d$rank[d$gene == "COL3A1"])`th most abundant gene in stellate nuclei and
+is detected in `r round(d$pct[d$gene == "COL3A1"], 1)`% of them. Collagen
+transcripts are clearly capturable in this preparation.
+
+**The problem is that the cells that should express *COL1A1* highly are not
+present!**
+
+```{r}
+#| label: col1a1-absence
+kable(data.frame(
+  `COL1A1 counts per nucleus` = c("0", "1-2", "3-4", "5-9", "10 or more"),
+  `Nuclei` = c(sum(col_dist == 0), sum(col_dist %in% 1:2), sum(col_dist %in% 3:4),
+               sum(col_dist %in% 5:9), sum(col_dist >= 10)),
+  check.names = FALSE), row.names = FALSE,
+  caption = "COL1A1 across all nuclei in the dataset.")
+```
+
+The highest *COL1A1* count in any nucleus in the entire dataset is
+`r max(col_dist)`, and only `r sum(col_dist >= 10)` nuclei carry ten or more. In
+a collagen-producing myofibroblast, *COL1A1* is among the most abundant
+transcripts in the library by a wide margin. A dataset-wide maximum of
+`r max(col_dist)` counts is not a detection failure, it is the absence of the
+cell type.
+
+Two things most plausibly explain that absence, and neither is assay chemistry.
+Myofibroblasts in fibrotic tissue are embedded in dense cross-linked matrix and
+are recovered poorly by dissociation, a bias that is worse the less tissue there
+is to work with and these are from needle core biopsy samples. And the cohort tops out at
+F3-F4 fibrosis in ten donors, which is not end-stage disease. Consistent with
+both, the stellate compartment is only
+`r round(100 * detect$n_cells / nrow(md), 1)`%
+of the nuclei analyzed, and stellate nuclei are among the most shallowly
+sequenced in the dataset at a median of
+`r format(round(detect$median_umi), big.mark = ",")` UMIs.
+
+The consequence for reading this report is specific. Abundance and
+pathway-level results do not depend on recovering myofibroblasts. Statements
+about stellate cells describe the hepatic stellate populations that were
+recovered, which are largely quiescent and activated states rather than
+matrix-producing myofibroblasts. Nothing here should be taken as evidence about
+myofibroblast biology in MASH, in either direction, and the flat collagen result
+in particular is not evidence against fibrogenesis. A dataset built on larger
+tissue pieces, precision-cut slices (as I've done in the past) or resections rather than cores, would be
+the appropriate design for that question.
+
+
+# Axis 1: which cell types change in abundance
+
+## Composition across the disease spectrum
+
+```{r}
+#| label: composition
+#| fig-width: 11
+#| fig-height: 4.6
+#| layout-nrow: 2
+
+props <- cached("donor_props.rds", {
+  tab <- table(md[[COL_DONOR]], md[[COL_CT_BROAD]])
+  list(counts = tab, props = sweep(tab, 1, rowSums(tab), "/"))
+})$props
+
+dstage <- donors$stage[match(rownames(props), donors$donor)]
+
+long <- data.frame(
+  donor = rep(rownames(props), ncol(props)),
+  cell_type = rep(colnames(props), each = nrow(props)),
+  prop = as.vector(props),
+  stage = rep(dstage, ncol(props)))
+
+# Order donors within stage by hepatocyte fraction, so the gradient is visible.
+hep <- props[, "Hepatocyte"]
+long$donor <- factor(long$donor, levels = rownames(props)[order(dstage, -hep)])
+
+pal <- setNames(
+  c("#E8743B", "#19A979", "#945ECF", "#13A4B4", "#525DF4", "#BF399E",
+    "#6C8893", "#EE6868", "#2F6497", "#B4B9C4", "#8A5B2E", "#C9C300"),
+  sort(unique(long$cell_type)))
+
+# Aggregated view: mean of the per-donor proportions within each stage, so every
+# donor contributes equally regardless of how many nuclei it yielded.
+agg <- aggregate(prop ~ cell_type + stage, long, mean)
+
+p0 <- ggplot(agg, aes(stage, prop, fill = cell_type)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = pal, name = NULL) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  labs(x = NULL, y = "mean proportion of nuclei") +
+  theme_bw(base_size = 10) +
+  theme(panel.grid = element_blank(), legend.key.size = unit(9, "pt"))
+p0
+
+p1 <- ggplot(long, aes(donor, prop, fill = cell_type)) +
+  geom_col(width = 1) +
+  facet_grid(~ stage, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = pal, name = NULL) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  labs(x = "donor", y = "proportion of nuclei") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid = element_blank(), legend.key.size = unit(9, "pt"))
+p1
+```
+
+The first panel aggregates within stage (and mirrors Figure 1b of Hong et al.), averaging the per-donor proportions so
+that each donor counts once regardless of how many nuclei it contributed. The
+second shows every donor separately. The hepatocyte compartment visibly contracts
+across the progression while lymphoid and myeloid compartments fill the space, and the
+effect is consistent enough to be apparent donor by donor rather than only on
+group means.
+
+```{r}
+#| label: stage-means
+
+stage_mean <- sapply(levels(donors$stage), function(s)
+  colMeans(props[dstage == s, , drop = FALSE]) * 100)
+stage_mean <- stage_mean[order(-stage_mean[, "No-MASLD"]), ]
+kable(round(stage_mean, 2),
+      caption = "Mean per-donor cell-type proportion (%) by disease stage.")
+```
+
+Hepatocytes fall from `r round(stage_mean["Hepatocyte", "No-MASLD"], 1)`% of
+nuclei in controls to `r round(stage_mean["Hepatocyte", "aMASH"], 1)`% in
+advanced MASH. The source paper reports approximately 48% to 21% for the same
+comparison, so this recovers their headline compositional result independently.
+
+## Differential abundance testing
+
+`propeller` operates on per-donor proportions: logit-transformed, then
+moderated t-tests with empirical Bayes shrinkage across cell types. The donor is
+the unit throughout, so 48 donors give 48 observations, not 249,233.
+
+```{r}
+#| label: propeller-primary
+
+library(speckle)
+sub_md <- md[!is.na(md$condition), ]
+
+prop_res <- cached("propeller_primary.rds", propeller(
+  clusters = sub_md[[COL_CT_BROAD]],
+  sample   = sub_md[[COL_DONOR]],
+  group    = sub_md$condition))
+
+prop_tab <- data.frame(
+  `Cell type`  = as.character(prop_res$BaselineProp.clusters),
+  `Control %`  = round(prop_res$PropMean.Control * 100, 2),
+  `MASH %`     = round(prop_res$PropMean.MASH * 100, 2),
+  `Fold change`= round(prop_res$PropMean.MASH / prop_res$PropMean.Control, 2),
+  FDR          = signif(prop_res$FDR, 3),
+  check.names  = FALSE)
+prop_tab <- prop_tab[order(-prop_tab$`Fold change`), ]
+
+# Significant cell types are marked in the table rather than left to the reader
+# to derive from the FDR column.
+prop_show <- prop_tab
+sig_ct <- prop_show$FDR < FDR_CUTOFF
+prop_show$`Cell type` <- ifelse(sig_ct, paste0("**", prop_show$`Cell type`, "**"),
+                                prop_show$`Cell type`)
+kable(prop_show, row.names = FALSE,
+      caption = paste0("propeller, Control (n=23) vs MASH (n=19), ranked by fold change. ",
+                       "Fold change is MASH relative to Control. Cell types in bold are ",
+                       "significant at Benjamini-Hochberg FDR < ", FDR_CUTOFF, " (",
+                       sum(sig_ct), " of ", nrow(prop_show), ")."))
+```
+
+```{r}
+#| label: propeller-plot
+#| fig-width: 10
+#| fig-height: 4
+
+# Every cell type significant in the primary contrast, ordered by fold change,
+# so the panel and the table agree.
+show <- prop_tab$`Cell type`[prop_tab$FDR < FDR_CUTOFF]
+pl <- subset(long, cell_type %in% show & !is.na(stage))
+pl$cell_type <- factor(pl$cell_type, levels = show)
+
+ggplot(pl, aes(stage, prop, fill = stage)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.6) +
+  facet_wrap(~ cell_type, scales = "free_y", nrow = 2) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#4C72B0", "#DD8452", "#C44E52", "#8172B3")) +
+  labs(x = NULL, y = "proportion of nuclei") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+`r sum(prop_tab$FDR < FDR_CUTOFF)` of `r nrow(prop_tab)` cell types change significantly in abundance. The pattern is a
+single coherent event: hepatocytes are lost
+(`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "Hepatocyte"], 2)`-fold,
+FDR `r fmt_p(prop_tab$FDR[prop_tab$"Cell type" == "Hepatocyte"])`) and every
+significant immune population expands, led by CD4 T cells
+(`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "CD4_T"], 1)`-fold) and
+CD8 T cells
+(`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "CD8_T"], 1)`-fold).
+
+Because proportions are compositional, these are not independent measurements.
+A large loss of hepatocytes mechanically raises every other fraction. The
+immune expansion should therefore be read as relative enrichment, not as proof
+of absolute immune infiltration, and that caveat applies to any proportion-based
+analysis of this kind.
+
+### Abundance across individual disease stages
+
+The two-group contrast pools early and advanced MASH. Testing the stages against
+each other separately shows where along the progression each shift occurs.
+
+```{r}
+#| label: stage-tables
+
+stagewise <- cached("propeller_stagewise.rds", {
+  out <- list()
+  for (cc in STAGE_CONTRASTS) {
+    sel <- md[[COL_STAGE]] %in% cc
+    out[[paste(cc, collapse = " vs ")]] <- propeller(
+      clusters = md[[COL_CT_BROAD]][sel],
+      sample   = md[[COL_DONOR]][sel],
+      group    = factor(as.character(md[[COL_STAGE]])[sel], levels = cc))
+  }
+  out
+})
+
+stage_table <- function(key) {
+  r <- stagewise[[key]]
+  cts <- as.character(r$BaselineProp.clusters)
+  # propeller reports the ratio of the first group to the second; invert so the
+  # column reads as change in the later stage relative to the earlier one.
+  fc <- round(1 / r$PropRatio, 2)
+  d <- data.frame(`Cell type` = ifelse(r$FDR < FDR_CUTOFF, paste0("**", cts, "**"), cts),
+                  `Fold change` = fc, FDR = signif(r$FDR, 3), check.names = FALSE)
+  d <- d[order(-d$`Fold change`), ]
+  kable(d, row.names = FALSE,
+        caption = paste0(key, ". Fold change is the later stage relative to the earlier. ",
+                         "Bold: FDR < ", FDR_CUTOFF, " (", sum(r$FDR < FDR_CUTOFF),
+                         " of ", nrow(r), ")."))
+}
+```
+
+```{r}
+#| label: stage-table-1
+stage_table("control vs eMASH")
+```
+
+```{r}
+#| label: stage-table-2
+stage_table("control vs aMASH")
+```
+
+```{r}
+#| label: stage-table-3
+stage_table("eMASH vs aMASH")
+```
+
+Control against early MASH and control against advanced MASH both recover the
+hepatocyte loss and lymphoid expansion seen in the pooled contrast. The
+early-versus-advanced comparison is informative but nothing is signficant after FDR adjustment.
+
+## Stage-resolved abundance: where the two-group test misleads
+
+Stellate cells are the central fibrosis cell type, yet they are flat in the
+two-group contrast
+(FDR `r fmt_p(prop_tab$FDR[prop_tab$"Cell type" == "Stellate_cell"])`).
+Splitting MASH back into its two stages explains why.
+
+```{r}
+#| label: stagewise
+
+nonmono <- stage_mean[c("Stellate_cell", "Cholangiocyte"), ]
+kable(round(nonmono, 2),
+      caption = "Two cell types whose abundance is not monotonic across the progression (%).")
+```
+
+Both dip through early disease and then expand at advanced fibrosis. Averaging
+eMASH and aMASH into a single MASH arm cancels the change, which is exactly why
+the two-group test returns nothing for stellate cells.
+
+```{r}
+#| label: stagewise-stellate
+
+ea <- stagewise[["eMASH vs aMASH"]]
+kable(data.frame(
+  `Cell type` = as.character(ea$BaselineProp.clusters),
+  `Fold change (aMASH/eMASH)` = round(1 / ea$PropRatio, 2),
+  `P` = signif(ea$P.Value, 3),
+  FDR = signif(ea$FDR, 3),
+  check.names = FALSE)[1:5, ], row.names = FALSE,
+  caption = "Top five cell types, early vs advanced MASH (9 vs 10 donors).")
+```
+
+Stellate cells are the strongest signal in this contrast, expanding
+`r round(1 / ea$PropRatio[ea$BaselineProp.clusters == "Stellate_cell"], 1)`-fold
+from early to advanced MASH
+(p `r fmt_p(ea$P.Value[ea$BaselineProp.clusters == "Stellate_cell"])`).
+
+Again, this does not survive multiple-testing correction
+(FDR `r fmt_p(ea$FDR[ea$BaselineProp.clusters == "Stellate_cell"])`), and the
+comparison rests on 9 versus 10 donors. I think what's going on here is a suggestive stage-specific pattern that is consistent with fibrosis
+biology and with the significant expression changes reported below, though not an
+established differential abundance result. It is reported because a two-group-only analysis
+would have recorded stellate cells as unchanged which isn't entirely true.
+
+# Axis 2: how each cell type is transcriptionally perturbed
+
+## Building donor-level pseudobulk
+
+Counts are summed within each (cell type, donor) pair. This is the step that
+makes the donor the replication unit: one pseudo-sample per donor per cell type,
+carrying that donor's condition label exactly once.
+
+```{r}
+#| label: pseudobulk
+
+MIN_CELLS  <- 20   # a pseudo-sample must aggregate at least this many nuclei
+MIN_DONORS <- 10   # a cell type needs this many donors in each group to be tested
+
+pb <- cached("pseudobulk_broad.rds", {
+  library(BPCells)
+  mat  <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  keep <- !meta[[COL_CT_BROAD]] %in% DROP_LABELS
+  grp  <- paste(as.character(meta[[COL_CT_BROAD]])[keep],
+                as.character(meta[[COL_DONOR]])[keep], sep = "__")
+  pseudobulk_matrix(mat[, which(keep)], cell_groups = grp, method = "sum")
+})
+
+pbmeta <- cached("pseudobulk_meta_broad.rds", {
+  key <- do.call(rbind, strsplit(colnames(pb), "__", fixed = TRUE))
+  m <- data.frame(pseudosample = colnames(pb), cell_type = key[, 1],
+                  donor = key[, 2], stringsAsFactors = FALSE)
+  m$n_cells <- as.integer(table(paste(md[[COL_CT_BROAD]], md[[COL_DONOR]],
+                                      sep = "__"))[m$pseudosample])
+  m$stage     <- donors$stage[match(m$donor, donors$donor)]
+  m$condition <- donors$condition[match(m$donor, donors$donor)]
+  m
+})
+pbmeta <- pbmeta[match(colnames(pb), pbmeta$pseudosample), ]
+
+cov <- with(subset(pbmeta, n_cells >= MIN_CELLS & !is.na(condition)),
+            table(cell_type, condition))
+kable(cov, caption = paste0("Donors passing the ", MIN_CELLS,
+      "-nucleus threshold, per cell type. Cell types below ", MIN_DONORS,
+      " donors in either group are not tested."))
+```
+
+Monocytes and dendritic cells fall out here. They are genuine populations, as
+the marker check established, but at a median of
+`r round(median(subset(pbmeta, cell_type == "Monocyte")$n_cells))` and
+`r round(median(subset(pbmeta, cell_type == "DC")$n_cells))` nuclei per donor
+their pseudobulk profiles are dominated by sampling noise. They remain in the
+abundance analysis, where donor proportions are still well estimated.
+
+## Differential expression
+
+DESeq2 per cell type, design `~ condition`.
+
+A gene is called differentially expressed on two criteria together:
+Benjamini-Hochberg FDR below `r FDR_CUTOFF`, and an absolute log2 fold change of
+at least `r LFC_CUTOFF`. Significance alone is a statement about confidence, not
+about size, and with 23 and 19 donors it admits changes too small to be
+interesting. The effect-size floor is applied as a filter on the results rather
+than as a null hypothesis in the model, so the reported p-values remain tests
+against no change. Enrichment analyses later in the report are unaffected as they
+rank all genes by the test statistic and never threshold.
+
+Donor is deliberately absent from the design. Each donor contributes exactly one
+condition, so donor is nested within condition; including it would absorb the
+between-donor variance that constitutes the effect being tested. There is no
+batch variable in the deposit, so nothing else is available to adjust for.
+
+This differs from the source paper, which ran differential expression
+cell-level with Seurat `FindMarkers`. That approach treats each nucleus as an
+independent replicate. With thousands of nuclei per donor the effective sample
+size is inflated by orders of magnitude, p-values shrink accordingly, and the
+resulting gene lists reflect the number of cells sequenced as much as the
+biology. Aggregating to the donor first is the standard correction.
+
+```{r}
+#| label: de
+
+de <- cached("de_primary.rds", {
+  library(DESeq2)
+  out <- list()
+  for (ct in sort(unique(pbmeta$cell_type))) {
+    sel <- pbmeta$cell_type == ct & pbmeta$n_cells >= MIN_CELLS &
+           !is.na(pbmeta$condition)
+    m <- pbmeta[sel, ]
+    if (any(table(m$condition) < MIN_DONORS)) next
+    cts <- round(pb[, m$pseudosample, drop = FALSE]); mode(cts) <- "integer"
+    cts <- cts[rowSums(cts > 0) >= ceiling(ncol(cts) / 3), , drop = FALSE]
+    dds <- DESeq(DESeqDataSetFromMatrix(cts, m, ~ condition), quiet = TRUE)
+    r <- as.data.frame(results(dds, contrast = c("condition", "MASH", "Control")))
+    r$gene <- rownames(r); r$cell_type <- ct
+    out[[ct]] <- r[order(r$padj), ]
+  }
+  out
+})
+
+de_severe <- cached("de_aMASH.rds", {
+  library(DESeq2)
+  out <- list()
+  for (ct in sort(unique(pbmeta$cell_type))) {
+    sel <- pbmeta$cell_type == ct & pbmeta$n_cells >= MIN_CELLS &
+           pbmeta$stage %in% c("No-MASLD", "aMASH")
+    m <- pbmeta[sel, ]
+    m$grp <- factor(as.character(m$stage), levels = c("No-MASLD", "aMASH"))
+    if (any(table(m$grp) < MIN_DONORS)) next
+    cts <- round(pb[, m$pseudosample, drop = FALSE]); mode(cts) <- "integer"
+    cts <- cts[rowSums(cts > 0) >= ceiling(ncol(cts) / 3), , drop = FALSE]
+    dds <- DESeq(DESeqDataSetFromMatrix(cts, m, ~ grp), quiet = TRUE)
+    r <- as.data.frame(results(dds, contrast = c("grp", "aMASH", "No-MASLD")))
+    r$gene <- rownames(r); r$cell_type <- ct
+    out[[ct]] <- r[order(r$padj), ]
+  }
+  out
+})
+
+deg <- data.frame(
+  `Cell type` = names(de),
+  Up   = sapply(de, function(r) sum(is_de(r) & r$log2FoldChange > 0)),
+  Down = sapply(de, function(r) sum(is_de(r) & r$log2FoldChange < 0)),
+  check.names = FALSE)
+deg$Total <- deg$Up + deg$Down
+deg$`vs aMASH` <- sapply(deg$`Cell type`, function(ct)
+  if (ct %in% names(de_severe))
+    sum(is_de(de_severe[[ct]])) else NA_integer_)
+deg <- deg[order(-deg$Total), ]
+kable(deg, row.names = FALSE,
+      caption = paste0("Differentially expressed genes by cell type (", DE_RULE,
+                       "). First three columns are MASH vs Control; the last is ",
+                       "control vs advanced MASH alone (NA = too few aMASH donors to test)."))
+```
+
+Hepatocytes are by a wide margin the most transcriptionally perturbed cell type
+(`r format(deg$Total[deg$"Cell type" == "Hepatocyte"], big.mark = ",")` genes at
+`r DE_RULE`), consistent with the source paper's observation that hepatocytes
+carry the most change with disease severity and that MASLD heritability is
+enriched in them.
+
+## Differential expression at detailed resolution
+
+The detailed annotation subdivides hepatocytes by zonation and stellate cells by
+state. The mural population identified above is relabeled here, since calling
+it an inactivated stellate cell would misattribute anything it contributes.
+
+```{r}
+#| label: detailed-de
+
+de_fine <- cached("de_detailed.rds", {
+  library(BPCells); library(DESeq2)
+  mt <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  meta$ct <- as.character(meta[[COL_CT_FINE]])
+  meta$ct[meta$ct == "Stellate_cell_inactivated"] <- "Mural_VSMC"
+  k <- !meta$ct %in% DROP_LABELS
+  grp <- paste(meta$ct[k], meta[[COL_DONOR]][k], sep = "__")
+  p <- pseudobulk_matrix(mt[, which(k)], cell_groups = grp, method = "sum")
+  nc <- table(grp); key <- do.call(rbind, strsplit(colnames(p), "__", fixed = TRUE))
+  dm <- unique(meta[, c(COL_DONOR, COL_STAGE)]); names(dm) <- c("donor", "stage")
+  m <- data.frame(pseudosample = colnames(p), cell_type = key[, 1], donor = key[, 2],
+                  n_cells = as.integer(nc[colnames(p)]), stringsAsFactors = FALSE)
+  m <- merge(m, dm, by = "donor"); m <- m[match(colnames(p), m$pseudosample), ]
+  m$condition <- factor(unname(CONDITION_MAP[as.character(m$stage)]), levels = CONDITION_LEVELS)
+  out <- list()
+  for (ct in sort(unique(m$cell_type))) {
+    sel <- m$cell_type == ct & m$n_cells >= MIN_CELLS & !is.na(m$condition)
+    mm <- m[sel, ]; if (any(table(mm$condition) < MIN_DONORS)) next
+    cts <- round(p[, mm$pseudosample, drop = FALSE]); mode(cts) <- "integer"
+    cts <- cts[rowSums(cts > 0) >= ceiling(ncol(cts) / 3), , drop = FALSE]
+    rownames(mm) <- mm$pseudosample
+    dds <- DESeq(DESeqDataSetFromMatrix(cts, mm, ~ condition), quiet = TRUE)
+    r <- as.data.frame(results(dds, contrast = c("condition", "MASH", "Control")))
+    r$gene <- rownames(r); out[[ct]] <- r[order(r$padj), ]
+  }
+  out
+})
+
+fine_tab <- data.frame(
+  `Cell type` = names(de_fine),
+  DEGs = sapply(de_fine, function(r) sum(is_de(r))),
+  check.names = FALSE)
+kable(fine_tab[order(-fine_tab$DEGs), ], row.names = FALSE,
+      caption = paste0("Differentially expressed genes (", DE_RULE,
+                       "), MASH vs Control, detailed annotation."))
+```
+
+`r length(de_fine)` of the 17 detailed labels clear the donor threshold, against
+10 of 12 at broad resolution. Monocytes and dendritic cells fail as before. The
+mural population fails too, for a reason worth noting: it contracts so sharply
+in disease that too few MASH donors retain enough of it to test. The correction
+made above therefore costs nothing.
+
+## The two axes are not the same measurement
+
+```{r}
+#| label: two-axis
+#| fig-width: 7.2
+#| fig-height: 5
+
+ax <- data.frame(
+  cell_type = deg$`Cell type`,
+  degs      = deg$Total,
+  fc        = prop_tab$`Fold change`[match(deg$`Cell type`, prop_tab$`Cell type`)],
+  fdr       = prop_tab$FDR[match(deg$`Cell type`, prop_tab$`Cell type`)])
+ax$abund_sig <- ifelse(ax$fdr < 0.05, "abundance FDR < 0.05", "abundance n.s.")
+
+ggplot(ax, aes(log2(fc), degs)) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey60") +
+  geom_point(aes(colour = abund_sig), size = 3) +
+  ggrepel::geom_text_repel(aes(label = cell_type), size = 3.1, seed = 1,
+                           max.overlaps = 20, min.segment.length = 0) +
+  scale_colour_manual(values = c("abundance FDR < 0.05" = "#C44E52",
+                                 "abundance n.s." = "grey55"), name = NULL) +
+  labs(x = "abundance change, log2(MASH / Control)",
+       y = paste0("genes (", DE_RULE, ")")) +
+  theme_bw(base_size = 11) + theme(legend.position = "top")
+```
+
+The two axes separate cleanly, and the separation is the substantive result.
+
+Endothelial cells are the clearest case. Their abundance does not move at all
+(fold change `r round(ax$fc[ax$cell_type == "Endothelial_cell"], 2)`, FDR
+`r fmt_p(ax$fdr[ax$cell_type == "Endothelial_cell"])`), yet they carry
+`r format(ax$degs[ax$cell_type == "Endothelial_cell"], big.mark = ",")`
+differentially expressed genes, the second-largest program in the dataset. A
+composition-only analysis would have called them unperturbed.
+
+The reverse also holds. CD4 and CD8 T cells show the largest abundance changes
+in the dataset but comparatively modest expression programs
+(`r ax$degs[ax$cell_type == "CD4_T"]` and `r ax$degs[ax$cell_type == "CD8_T"]`
+genes). They arrive in greater numbers without substantially altering the
+program they run.
+
+Hepatocytes are the only cell type strongly perturbed on both axes: they are
+lost, and those that remain are extensively rewired.
+
+# Synthesis across axes: which cell types are most perturbed, and how
+
+```{r}
+#| label: synthesis
+
+top_genes <- function(ct, up = TRUE, n = 4) {
+  if (!ct %in% names(de)) return("not tested")
+  r <- de[[ct]]
+  r <- r[is_de(r), ]
+  r <- r[if (up) order(-r$log2FoldChange) else order(r$log2FoldChange), ]
+  if (!nrow(r)) return("-")
+  paste(head(r$gene, n), collapse = ", ")
+}
+
+syn <- data.frame(
+  `Cell type` = prop_tab$`Cell type`,
+  `Abundance FC` = prop_tab$`Fold change`,
+  `Abundance FDR` = prop_tab$FDR,
+  check.names = FALSE)
+syn$DEGs <- deg$Total[match(syn$`Cell type`, deg$`Cell type`)]
+syn$`Top up`   <- vapply(as.character(syn$`Cell type`), top_genes, "", up = TRUE)
+syn$`Top down` <- vapply(as.character(syn$`Cell type`), top_genes, "", up = FALSE)
+
+# Rank on both axes jointly: significant abundance change and size of the
+# expression program both count toward "most perturbed".
+syn$abund_rank <- rank(-abs(log2(syn$`Abundance FC`)) * (syn$`Abundance FDR` < 0.05))
+syn$de_rank    <- rank(-ifelse(is.na(syn$DEGs), 0, syn$DEGs))
+syn <- syn[order((syn$abund_rank + syn$de_rank) / 2), ]
+syn$`Abundance FDR` <- signif(syn$`Abundance FDR`, 2)
+syn$DEGs <- ifelse(is.na(syn$DEGs), "not tested", format(syn$DEGs, big.mark = ","))
+
+kable(syn[, c("Cell type", "Abundance FC", "Abundance FDR", "DEGs",
+              "Top up", "Top down")], row.names = FALSE,
+      caption = paste0("Cell types ranked by combined perturbation across both axes. ",
+                       "Abundance FC is MASH relative to Control; DEGs are genes at ", DE_RULE, "."))
+```
+
+Reading the table against the question asked:
+
+**Hepatocytes are the most perturbed cell type in MASH, on both axes at once.**
+They fall from `r round(stage_mean["Hepatocyte", "No-MASLD"], 1)`% to
+`r round(stage_mean["Hepatocyte", "aMASH"], 1)`% of nuclei, and the survivors
+carry `r format(deg$Total[deg$"Cell type" == "Hepatocyte"], big.mark = ",")`
+differentially expressed genes, more than twice any other cell type. No other
+population is strongly perturbed in both senses.
+
+**Endothelial cells are the most perturbed cell type that a composition
+analysis would miss entirely.** Their abundance is unchanged, and they carry the
+second-largest expression program in the dataset. This is the clearest
+argument for separating the two axes rather than reporting "perturbation" as one
+quantity.
+
+**T cells are the largest abundance change and a comparatively small expression
+change.** CD4 and CD8 T cells expand
+`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "CD4_T"], 1)`-fold and
+`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "CD8_T"], 1)`-fold, with
+modest programs. This is the observed evidence that they were recruited, not reprogrammed.
+
+**Macrophages change identity rather than number.** A
+`r round(prop_tab$"Fold change"[prop_tab$"Cell type" == "Macrophage"], 1)`-fold
+abundance increase accompanies a wholesale switch from the homeostatic Kupffer
+program to the scar-associated program, which is the most mechanistically
+specific finding in the dataset.
+
+**Stellate cells are the one case where the headline contrast is misleading.**
+They are flat in abundance between Control and MASH and carry
+`r format(deg$Total[deg$"Cell type" == "Stellate_cell"], big.mark = ",")`
+differentially expressed genes. Both numbers understate the situation: their
+expansion is confined to advanced fibrosis, and their expression program is
+partly a mixture artifact of a label that contains vascular mural cells.
+
+# What the expression changes mean
+
+The DE results were checked against programs MASH is known to engage. These
+are recovered from the data and where the data disagree
+with expectation that is reported rather than smoothed over.
+
+```{r}
+#| label: programs
+
+prog_target <- c(HSC_activation = "Stellate_cell", Scar_macrophage = "Macrophage",
+                 Kupffer_homeostatic = "Macrophage", LSEC_identity = "Endothelial_cell",
+                 Ductular_reaction = "Cholangiocyte")
+
+prog <- do.call(rbind, lapply(names(prog_target), function(pn) {
+  r <- de[[prog_target[pn]]]
+  g <- MASH_PROGRAMS[[pn]]
+  s <- r[match(g, r$gene), c("gene", "log2FoldChange", "padj")]
+  data.frame(program = pn, `Cell type` = unname(prog_target[pn]),
+             Gene = g, log2FC = round(s$log2FoldChange, 2),
+             FDR = signif(s$padj, 2), check.names = FALSE)
+}))
+kable(prog, row.names = FALSE,
+      caption = "Expected MASH programs, log2 fold change MASH vs Control. NA = gene did not pass the detection filter in that cell type.")
+```
+
+**The macrophage switch is recovered exactly as expected.** Scar-associated
+markers rise (*SPP1*, *GPNMB*, *CD9*) while the homeostatic Kupffer program
+falls (*MARCO*, *VSIG4*, *CD5L*, all FDR < 0.05). This is the documented
+replacement of resident Kupffer cells by lipid- and scar-associated macrophages,
+and it appears here without being sought.
+
+*TREM2*, the canonical marker for that population, is absent from the table
+because it failed the detection filter: it is non-zero in only 5 of 42
+macrophage pseudo-samples. *TREM2* is present in the object, so this is not a
+biological absence. Two things might be contributing: single-nucleus capture is insensitive
+to it, and the deposited object was built after removing genes expressed in
+fewer than 0.25% of cells in each donor, so lowly detected transcripts were
+thinned before the object was assembled.
+
+**Stellate cells appear to contradict expectation, and the contradiction is
+informative.** *ACTA2* and *TAGLN* both fall significantly, the opposite of the
+classical activation signature. Resolving this requires separating markers that
+are specific to hepatic stellate cells from those shared with vascular mural
+cells.
+
+```{r}
+#| label: stellate-resolve
+
+hsc <- c("LRAT", "DCN", "COL1A1", "COL1A2", "COL3A1")
+mural <- c("MYH11", "MYL9", "TAGLN", "ACTA2", "RGS5", "NOTCH3")
+r <- de$Stellate_cell
+s <- r[match(c(hsc, mural), r$gene), c("gene", "log2FoldChange", "padj")]
+kable(data.frame(
+  Identity = c(rep("HSC-specific", length(hsc)), rep("mural / smooth muscle", length(mural))),
+  Gene = c(hsc, mural), log2FC = round(s$log2FoldChange, 2),
+  FDR = signif(s$padj, 2), check.names = FALSE), row.names = FALSE,
+  caption = "Stellate compartment, split by marker identity (MASH vs Control).")
+```
+
+The split is systematic. HSC-restricted genes rise (*LRAT*, the retinoid-storage
+enzyme that defines hepatic stellate cells, and *DCN*), while smooth-muscle
+genes fall (*MYH11*, *MYL9*, *TAGLN*). *ACTA2* is ambiguous: it marks both
+activated stellate cells and vascular smooth muscle, so it cannot arbitrate.
+*MYH11* and *MYL9* can, and they are unambiguously mural.
+
+The `Stellate_cell` label therefore contains a mixture of true hepatic stellate
+cells and vascular mural cells, and MASH shifts the mixture toward the former.
+The apparent loss of an activation signature is a composition shift inside the
+label, not deactivation of stellate cells. This is a caution about pseudobulk in
+general: aggregating over a heterogeneous label can invert the direction of a
+program.
+
+**LSEC identity is only partly perturbed.** *LYVE1* falls significantly, but
+*CLEC4G* and *STAB2* do not, so the classical capillarization signature is not
+cleanly reproduced at this resolution despite endothelial cells carrying the
+second-largest expression program in the dataset. The endothelial perturbation
+is real and large but it is not well summarized by these four genes.
+
+**The ductular reaction is not detected.** *KRT19*, *KRT7*, *SOX9* and *EPCAM*
+all trend downward in cholangiocytes and none reach significance. Cholangiocyte
+abundance does rise at advanced fibrosis
+(`r round(stage_mean["Cholangiocyte", "No-MASLD"], 1)`% to
+`r round(stage_mean["Cholangiocyte", "aMASH"], 1)`%), so any ductular expansion
+here is compositional rather than a within-cell-type program, and it is
+measured on the fewest donors of any tested cell type.
+
+## Benchmarking against the reference fibrosis atlas
+
+Ramachandran et al.
+(2019) resolved the fibrotic niche of human cirrhotic liver and described three
+populations that have since become the reference framework: TREM2+CD9+
+scar-associated macrophages, PLVAP+/ACKR1+ scar-associated endothelial cells,
+and PDGFRA+ scar-associated mesenchymal cells. All three are testable here.
+
+The design differences matter for interpreting the result. That study profiled
+end-stage cirrhotic explants by single-cell RNA-seq of dissociated whole cells.
+This is needle-core biopsy tissue spanning F0 to F4, with ten donors at F3-F4,
+by single-nucleus RNA-seq.
+
+```{r}
+#| label: ramachandran
+
+niche <- list(
+  `Scar-associated macrophage` = list(ct = "Macrophage",
+    genes = c("TREM2","CD9","GPNMB","SPP1","FABP5","ACP5","LGALS3","CTSD")),
+  `Resident Kupffer identity`  = list(ct = "Macrophage",
+    genes = c("MARCO","VSIG4","CD5L","TIMD4","LYVE1","CETP")),
+  `Scar-associated endothelium` = list(ct = "Endothelial_cell",
+    genes = c("PLVAP","ACKR1","CD34","VWA1")),
+  `LSEC identity`              = list(ct = "Endothelial_cell",
+    genes = c("CLEC4G","CLEC4M","STAB2","OIT3","FCN2","LYVE1")),
+  `PDGFRA+ mesenchyme`         = list(ct = "Stellate_cell",
+    genes = c("PDGFRA","OSMR","COL1A1","COL3A1","LOXL1")))
+
+ram <- do.call(rbind, lapply(names(niche), function(nm) {
+  x <- niche[[nm]]; r <- de[[x$ct]]; i <- match(x$genes, r$gene)
+  data.frame(program = nm, `Cell type` = x$ct, Gene = x$genes,
+             log2FC = round(r$log2FoldChange[i], 2),
+             FDR = signif(r$padj[i], 2), check.names = FALSE)
+}))
+ram$Result <- ifelse(is.na(ram$FDR), "not detected",
+              ifelse(ram$FDR >= FDR_CUTOFF | abs(ram$log2FC) < LFC_CUTOFF, "n.s.",
+              ifelse(ram$log2FC > 0, "up", "down")))
+kable(ram, row.names = FALSE,
+      caption = paste0("Ramachandran et al. fibrotic-niche programs, tested in this ",
+                       "dataset (MASH vs Control). Result applies ", DE_RULE, "."))
+```
+
+**The scar-associated macrophage population replicates cleanly.** *SPP1*,
+*FABP5*, *ACP5*, *GPNMB*, *LGALS3* and *CTSD* all rise significantly, with *CD9*
+just short of threshold and *TREM2* undetectable for the reasons given in the
+limitations. The reciprocal half is equally clear: the resident Kupffer
+program falls across every marker tested.
+
+*TIMD4* is the informative one. It marks embryonically derived, self-renewing
+Kupffer cells, and its loss
+(`r ram$log2FC[ram$Gene == "TIMD4"]`, FDR `r fmt_p(ram$FDR[ram$Gene == "TIMD4"])`)
+alongside gain of the TREM2/CD9 program is the signature of resident
+macrophages being replaced by monocyte-derived cells. That is the mechanism
+Ramachandran described in cirrhosis, recovered here in a different disease,
+tissue source and assay.
+
+**The scar-associated endothelial population is not reproduced, and the data
+point the other way.** *PLVAP* falls rather than rises. Because pseudobulk over
+all endothelial cells could dilute a rare subpopulation, the fraction of
+endothelial nuclei expressing it was tested directly at donor level.
+
+```{r}
+#| label: plvap-fraction
+
+plvap <- cached("plvap_fraction.rds", {
+  library(BPCells)
+  mt <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  sel <- meta[[COL_CT_BROAD]] == "Endothelial_cell"
+  v <- as.vector(as.matrix(mt["PLVAP", which(sel)]))
+  data.frame(donor = meta[[COL_DONOR]][sel], stage = meta[[COL_STAGE]][sel],
+             pos = v > 0)
+})
+
+pf <- aggregate(pos ~ donor, plvap, function(x) mean(x) * 100)
+pf$condition <- donors$condition[match(pf$donor, donors$donor)]
+tt <- t.test(pos ~ condition, data = subset(pf, !is.na(condition)))
+
+kable(data.frame(
+  Group = c("Control", "MASH"),
+  `PLVAP+ endothelial nuclei (%)` = round(unname(tt$estimate), 2),
+  check.names = FALSE), row.names = FALSE,
+  caption = paste0("Donor-level fraction of PLVAP-expressing endothelial nuclei (p = ",
+                   signif(tt$p.value, 2), ")."))
+```
+
+PLVAP-positive endothelial cells are uncommon in this tissue and become
+significantly *less* common in disease, falling from
+`r round(tt$estimate[1], 1)`% to `r round(tt$estimate[2], 1)`% of endothelial
+nuclei (p `r fmt_p(tt$p.value)`). *ACKR1* is present in the object but too
+sparsely detected to test.
+
+There is also no capillarization. Sinusoidal identity is preserved across the
+whole progression: *STAB2*, *CLEC4G*, *CLEC4M*, *OIT3* and *FCN2* are unchanged
+or slightly up, and only *LYVE1* declines. That is consistent with the
+endothelial co-expression module reported below, `endo-M8`, which carries
+*STAB2*, *OIT3* and *CLEC4M* and moves upward. Endothelial cells in this cohort
+are transcriptionally very active, as the
+`r format(sum(is_de(de$Endothelial_cell)), big.mark = ",")` differentially expressed genes
+show, but the direction of that activity is inflammatory rather than a loss of
+sinusoidal identity.
+
+**The PDGFRA+ mesenchymal population is not reproduced either.** *PDGFRA* and
+the collagens do not move significantly. This is the same gap as the absent
+myofibroblast compartment documented in the limitations, seen from another
+angle. The one suggestion of the program is *OSMR*, which is not significant
+in the primary contrast but is in the advanced-fibrosis contrast.
+
+```{r}
+#| label: osmr
+osmr <- de_severe$Stellate_cell[de_severe$Stellate_cell$gene == "OSMR",
+                                c("log2FoldChange", "padj")]
+kable(data.frame(Gene = "OSMR", `Cell type` = "Stellate_cell",
+                 Contrast = "control vs aMASH",
+                 log2FC = round(osmr$log2FoldChange, 2),
+                 FDR = signif(osmr$padj, 2), check.names = FALSE),
+      row.names = FALSE)
+```
+
+
+### What the pattern of hits and misses says
+
+The two failures are not independent. Both scar-associated endothelium and
+PDGFRA+ mesenchyme are components of a fibrotic niche organized around
+myofibroblasts and scar matrix, and both are physically embedded in it. The
+population that does replicate, scar-associated macrophages, is the one that is
+not. Combined with the absent myofibroblast compartment, I think the
+explanation is that this tissue preparation does not recover cells resident in
+dense scar, rather than that the niche is absent from MASH.
+
+Disease stage points the same way. The reference study profiled end-stage
+cirrhosis while the most advanced donors here are F3-F4 and there are ten of them.
+
+This makes a concrete prediction, which is the useful form for a negative
+result: a MASH dataset built from precision-cut slices, resections or explants
+should recover the scar-associated endothelial and mesenchymal populations,
+while a needle-core study of comparable stage should not. What can be said from
+this cohort is that the macrophage arm of the fibrotic niche is present and
+measurable in MASH well before cirrhosis.
+
+# Pathway-level interpretation
+
+The method I employed is GSEA (`fgsea`) on the MSigDB Hallmark collection, ranking genes by
+the DESeq2 Wald statistic. GSEA rather than over-representation testing because
+the pseudobulk DE produces a signed statistic for every tested gene, and ranking
+on all of it uses information that a hard FDR < 0.05 cutoff would discard.
+Hallmark rather than a finer collection because the question is what is
+happening to each cell type, and Hallmark's 50 sets are curated to minimize the
+redundancy that makes larger collections unreadable.
+
+```{r}
+#| label: gsea
+
+gsea <- cached("gsea_primary.rds", {
+  library(fgsea); library(msigdbr)
+  hall <- msigdbr(species = "Homo sapiens", collection = "H")
+  sets <- split(hall$gene_symbol, hall$gs_name)
+  names(sets) <- sub("^HALLMARK_", "", names(sets))
+  out <- list()
+  for (ct in names(de)) {
+    r <- de[[ct]]; r <- r[!is.na(r$stat), ]
+    stats <- setNames(r$stat, r$gene); stats <- stats[!duplicated(names(stats))]
+    set.seed(42)
+    res <- fgsea(sets, stats, minSize = 10, maxSize = 500, nPermSimple = 10000)
+    res$cell_type <- ct
+    out[[ct]] <- res[order(res$padj), ]
+  }
+  out
+})
+
+gs_all <- do.call(rbind, lapply(names(gsea), function(ct) {
+  d <- as.data.frame(gsea[[ct]]); d[, c("pathway", "NES", "padj", "cell_type")]
+}))
+```
+
+## What each cell type is doing
+
+```{r}
+#| label: gsea-heatmap
+#| fig-width: 9
+#| fig-height: 7
+#| column: page
+
+# Restrict to pathways that are significant somewhere with a substantial effect.
+# Every significant set would be 44 rows, which is unreadable at display size;
+# this keeps the strongest 25 and the panel legible.
+keep_p <- unique(subset(gs_all, padj < 0.05 & abs(NES) > 1.75)$pathway)
+hm <- subset(gs_all, pathway %in% keep_p)
+hm$label <- ifelse(hm$padj < 0.05, "*", "")
+hm$NES_show <- ifelse(hm$padj < 0.05, hm$NES, NA)
+
+ord <- tapply(hm$NES_show, hm$pathway, function(x) mean(x, na.rm = TRUE))
+hm$pathway <- factor(hm$pathway, levels = names(sort(ord)))
+
+ggplot(hm, aes(cell_type, pathway, fill = NES_show)) +
+  geom_tile(colour = "grey92", linewidth = 0.3) +
+  geom_text(aes(label = label), size = 3, vjust = 0.75) +
+  scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                       midpoint = 0, na.value = "grey96", name = "NES") +
+  labs(x = NULL, y = NULL,
+       caption = "* FDR < 0.05. Grey = not significant in that cell type.") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 9),
+        panel.grid = element_blank())
+```
+
+**Hepatocytes lose their specialized metabolic identity and mount an injury
+response.** Bile acid metabolism, xenobiotic metabolism and fatty acid
+metabolism all fall, while the p53 pathway rises
+(NES `r round(subset(gs_all, cell_type == "Hepatocyte" & pathway == "P53_PATHWAY")$NES, 2)`,
+FDR `r fmt_p(subset(gs_all, cell_type == "Hepatocyte" & pathway == "P53_PATHWAY")$padj)`)
+alongside all three proliferation sets. That combination, loss of differentiated
+function with simultaneous stress signalling and cell-cycle entry, is the
+transcriptional signature of a compartment being damaged and regenerating. It
+independently reproduces the source paper's description of reduced hepatocyte
+metabolic function in MASH.
+
+**Macrophages turn on cholesterol handling.** `CHOLESTEROL_HOMEOSTASIS` is the
+strongest positive result in that cell type
+(NES `r round(subset(gs_all, cell_type == "Macrophage" & pathway == "CHOLESTEROL_HOMEOSTASIS")$NES, 2)`),
+with TNFA/NF-kB signalling also up. This is the pathway-level counterpart of the
+gene-level switch reported above: the *GPNMB*, *SPP1* and *CD9* population that
+replaces homeostatic Kupffer cells is a lipid-handling, inflammatory macrophage.
+
+**Endothelial cells are inflammatory, not merely present.** `TNFA_SIGNALING_VIA_NFKB`
+is their top result
+(NES `r round(subset(gs_all, cell_type == "Endothelial_cell" & pathway == "TNFA_SIGNALING_VIA_NFKB")$NES, 2)`).
+This supplies the missing interpretation for the most striking result in the
+abundance analysis: endothelial cells do not change in number at all, yet carry
+the second-largest expression program in the dataset, and that program is
+inflammatory activation.
+
+**Cholangiocytes activate Hedgehog signalling**
+(NES `r round(subset(gs_all, cell_type == "Cholangiocyte" & pathway == "HEDGEHOG_SIGNALING")$NES, 2)`)
+together with inflammatory response, while oxidative phosphorylation falls.
+Hedgehog is an established fibrogenic pathway in MASH and is consistent with the
+cholangiocyte expansion seen at advanced fibrosis, even though the classical
+*KRT19*/*KRT7* ductular markers did not reach significance gene by gene.
+
+**Proliferation moves in opposite directions, which is the clearest evidence the
+results are biological.** Hepatocytes gain E2F targets, G2M checkpoint and
+mitotic spindle while NK cells lose all three, and lose them strongly
+(`E2F_TARGETS` NES `r round(subset(gs_all, cell_type == "NK" & pathway == "E2F_TARGETS")$NES, 2)`,
+FDR `r fmt_p(subset(gs_all, cell_type == "NK" & pathway == "E2F_TARGETS")$padj)`).
+The lymphoid populations that expand several-fold in abundance are therefore not
+expanding by local proliferation. That is consistent with recruitment, and with
+the earlier observation that T cells change greatly in number while changing
+their expression program comparatively little. It is consistent with
+recruitment rather than a demonstration of it. That said, this dataset is a single snapshot
+per donor and cannot establish where those cells came from.
+
+# Resolving the signature
+
+## Is the hepatocyte response zonal?
+
+Hepatocytes split into pericentral, periportal and interzonal, and the analysis so far appears to say the pericentral zone is most perturbed. However, that reading does
+not survive scrutiny as the zones differ in donor coverage and in cell numbers, so
+they differ in power before any biology is considered.
+
+```{r}
+#| label: zonation
+
+z <- c("Hepatocyte_pericentral", "Hepatocyte_periportal", "Hepatocyte_interzonal")
+lab <- c("PC", "PP", "IZ")
+cz <- Reduce(intersect, lapply(de_fine[z], function(r) r$gene))
+fz <- sapply(de_fine[z], function(r) r$log2FoldChange[match(cz, r$gene)])
+az <- sapply(de_fine[z], function(r) r$padj[match(cz, r$gene)])
+colnames(fz) <- colnames(az) <- lab
+sigz <- !is.na(az) & az < FDR_CUTOFF & abs(fz) >= LFC_CUTOFF
+shared <- rowSums(sigz) == 3
+concordant <- sum(abs(rowSums(sign(fz[shared, ]))) == 3, na.rm = TRUE)
+
+# Donors contributing a testable pseudo-sample, counted the same way the DE did.
+zone_donors <- sapply(z, function(x) {
+  k <- md[[COL_CT_FINE]] == x
+  n <- table(md[[COL_DONOR]][k])
+  d <- unique(md[, c(COL_DONOR, "condition")])
+  d <- d[match(names(n), d[[COL_DONOR]]), ]
+  ok <- n >= MIN_CELLS & !is.na(d$condition)
+  paste(sum(ok & d$condition == "Control"), "/", sum(ok & d$condition == "MASH"))
+})
+
+kable(data.frame(
+  Zone = lab,
+  `Donors (Control / MASH)` = zone_donors,
+  `Nuclei` = format(sapply(z, function(x) sum(md[[COL_CT_FINE]] == x)), big.mark = ","),
+  `DEGs` = sapply(z, function(x) sum(is_de(de_fine[[x]]))),
+  `Median |log2FC|` = round(apply(abs(fz), 2, median, na.rm = TRUE), 3),
+  check.names = FALSE), row.names = FALSE,
+  caption = "Hepatocyte zones: differential expression against available power.")
+```
+
+The DEG counts track donor and nucleus numbers, not effect size. Median absolute
+fold change is essentially identical across the three zones
+(`r paste(round(apply(abs(fz), 2, median, na.rm = TRUE), 2), collapse = ", ")`),
+and the pairwise correlation of fold changes between zones is
+`r round(min(cor(fz, use = "complete.obs")[lower.tri(diag(3))]), 2)` to
+`r round(max(cor(fz, use = "complete.obs")[lower.tri(diag(3))]), 2)`.
+
+Of the `r format(sum(shared), big.mark = ",")` genes significant in all three
+zones, `r format(concordant, big.mark = ",")` agree in direction. That is
+`r round(100 * concordant / sum(shared))`%.
+
+**Hepatocytes mount one disease program, not three zonal ones.** This matters
+for how the result is used. If the response were zone-restricted, any
+intervention would have to reach the right zone to be effective. It is not:
+zonal identity is preserved as a baseline, and the MASH response is superimposed
+on all three compartments in the same direction and at the same magnitude.
+
+## Module-level structure
+
+Individual genes are a difficult unit to act on. The source study built
+co-expression modules with hdWGCNA and deposited both the module definitions and
+per-cell harmonized module eigengenes. Those are reused here rather than
+recomputed, but tested at the donor level, which their own analysis did not do.
+
+```{r}
+#| label: modules
+
+mod_res <- cached("module_de.rds", {
+  dirp <- "data/unzipped/Zenodo/hdWGCNA_results"
+  meta <- readRDS(cache_path("meta.rds"))
+  meta$cond <- unname(CONDITION_MAP[meta[[COL_STAGE]]])
+  do.call(rbind, lapply(c("hepatocyte","stellate_cell","endothelial_cell","cholangiocyte"),
+    function(tag) {
+      x <- read.delim(gzfile(file.path(dirp, paste0(tag, "_hME.txt.gz"))), check.names = FALSE)
+      rownames(x) <- x[[1]]; x <- x[, -1, drop = FALSE]
+      x <- x[, colnames(x) != "grey", drop = FALSE]
+      cm <- intersect(rownames(x), rownames(meta))
+      x <- x[cm, , drop = FALSE]; mm <- meta[cm, ]
+      dmean <- t(sapply(colnames(x), function(k)
+        tapply(x[[k]], mm[[COL_DONOR]], mean, na.rm = TRUE)))
+      dn <- unique(mm[, c(COL_DONOR, "cond")]); rownames(dn) <- dn[[COL_DONOR]]
+      dn <- dn[colnames(dmean), ]; kp <- !is.na(dn$cond)
+      r <- do.call(rbind, lapply(rownames(dmean), function(k) {
+        tt <- t.test(dmean[k, kp] ~ factor(dn$cond[kp], levels = CONDITION_LEVELS))
+        data.frame(cell_type = tag, module = k,
+                   diff = unname(tt$estimate[2] - tt$estimate[1]), p = tt$p.value)
+      }))
+      r$FDR <- p.adjust(r$p, "BH"); r
+    }))
+})
+
+sig_mod <- subset(mod_res, FDR < 0.05)
+sig_mod <- sig_mod[order(sig_mod$FDR), ]
+kable(data.frame(
+  `Cell type` = sig_mod$cell_type, Module = sig_mod$module,
+  `Change in MASH` = round(sig_mod$diff, 2), FDR = signif(sig_mod$FDR, 2),
+  check.names = FALSE), row.names = FALSE,
+  caption = "Co-expression modules differentially expressed between MASH and Control, tested on per-donor mean module eigengenes.")
+```
+
+`r nrow(sig_mod)` of `r nrow(mod_res)` deposited modules move significantly at
+donor level. The distribution matches the gene-level results closely:
+`r sum(sig_mod$cell_type == "endothelial_cell")` of nine endothelial modules
+shift despite endothelial cells not changing in abundance at all, which is the
+same dissociation reported earlier arriving through an independent construction.
+
+The largest hepatocyte effect is **Hep-M12**, down by
+`r round(abs(sig_mod$diff[sig_mod$module == "Hep-M12"]), 2)`
+(FDR `r fmt_p(sig_mod$FDR[sig_mod$module == "Hep-M12"])`). Its highest-connectivity
+members are *FGB*, *FGG*, *FGA*, *FGL1*, *CP*, *CYP3A5* and *PCK1*: fibrinogen
+synthesis, copper transport, drug metabolism and gluconeogenesis. It is a
+hepatocyte secretory and metabolic identity program, and it is the single
+most-perturbed coordinated unit found anywhere in this analysis.
+
+Two further observations: The upregulated
+hepatocyte module Hep-M6 contains *PPARA*, *MLXIPL* and *PLIN5*, and the
+upregulated stellate module HSC-M3 contains *NR1H4*. Both are nuclear receptors
+with existing pharmacology in metabolic liver disease, which is a reassuring
+sign that the signature is not disconnected from known biology. Nothing here directly
+tests any drug, and no directional inference about a therapeutic effect follows
+from a module changing.
+
+# Discussion
+
+## What this dataset can and cannot say about MASH therapeutics
+
+MASH now has FDA approved drugs and a crowded development pipeline, and a natural
+question is whether a dataset like this speaks to any of them. It does, but only
+in a specific and limited way.
+
+An observational cross-sectional cohort of 48 donors can establish two things
+about a drug target: whether the target is expressed in the cell type the drug
+is meant to act on, and whether the program that target controls is among the
+things disease has perturbed. Those are questions about whether a mechanism is
+*engageable* and *relevant* in human MASH liver. 
+
+With that stated, the dataset does separate the pipeline into three groups.
+
+```{r}
+#| label: drug-targets
+
+drug_expr <- cached("drug_target_expr.rds", {
+  library(BPCells)
+  mt <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  k <- !meta[[COL_CT_BROAD]] %in% DROP_LABELS
+  ctf <- factor(as.character(meta[[COL_CT_BROAD]])[k]); sb <- mt[, which(k)]
+  nmz <- log1p(multiply_cols(sb, 1e4 / colSums(sb)))
+  gg <- c("THRB","DIO1","GLP1R","GCGR","GIPR","KLB","FGFR1","NR1H4","NR0B2",
+          "PPARA","PPARD","PPARG","ITGAV","ITGB1","ITGB6","ITGB8",
+          "TGFB1","TGFBR1","TGFBR2","LOXL2","LOX","LOXL1")
+  present <- gg[gg %in% rownames(mt)]
+  a <- pseudobulk_matrix(nmz[present, ], cell_groups = ctf, method = "mean")
+  n <- pseudobulk_matrix(sb[present, ],  cell_groups = ctf, method = "nonzeros")
+  list(avg = a, pct = sweep(n, 2, as.integer(table(ctf)), "/") * 100,
+       absent = setdiff(gg, present))
+})
+
+targ <- data.frame(
+  Target = c("THRB", "GCGR", "GLP1R", "GIPR", "KLB", "NR1H4", "PPARA", "PPARD",
+             "PPARG", "ITGAV", "ITGB6", "TGFB1", "LOXL2", "LOX"),
+  Drug = c("resmetirom", "survodutide (glucagon arm)", "semaglutide",
+           "tirzepatide (GIP arm)", "FGF21 analogues", "FXR agonists",
+           "elafibranor, lanifibranor", "seladelpar, elafibranor",
+           "lanifibranor", "integrin inhibitors", "integrin avb6 inhibitors",
+           "TGF-beta blockade", "simtuzumab", "LOX inhibitors"),
+  stringsAsFactors = FALSE)
+
+look <- function(g, what) {
+  if (g %in% drug_expr$absent) return(NA_real_)
+  m <- drug_expr[[what]]
+  if (!g %in% rownames(m)) return(NA_real_)
+  max(m[g, ])
+}
+where <- function(g) {
+  if (g %in% drug_expr$absent) return("not in object")
+  colnames(drug_expr$avg)[which.max(drug_expr$avg[g, ])]
+}
+targ$`Highest in`  <- sapply(targ$Target, where)
+targ$`Mean expr`   <- round(sapply(targ$Target, look, "avg"), 2)
+targ$`% expressing`<- round(sapply(targ$Target, look, "pct"), 1)
+kable(targ, row.names = FALSE,
+      caption = "Where each target is expressed. Mean expression and percent are for the cell type where the target is highest.")
+```
+
+### Targets that are well represented in this tissue
+
+**THR-beta (resmetirom).** *THRB* is expressed in
+`r round(drug_expr$pct["THRB", "Hepatocyte"], 1)`% of hepatocytes, the highest of
+any cell type, and it is not itself altered in disease. The programs it
+regulates are hepatocyte fatty acid metabolism, bile acid metabolism and
+xenobiotic metabolism are all significantly depleted in MASH here, and that loss
+of differentiated metabolic function is the dominant hepatocyte finding in this
+report. So the receptor is abundant and intact in exactly the cell type whose
+metabolic program has degraded. That is a coherent target-tissue picture, and
+it is the most straightforwardly supported mechanism in the dataset.
+
+**FXR (obeticholic acid and successors).** *NR1H4* is well expressed in both
+hepatocytes and stellate cells. More informative than the receptor is its
+output: *NR0B2*, the canonical FXR target gene, is strongly reduced in
+hepatocytes
+(log2FC `r round(de$Hepatocyte$log2FoldChange[de$Hepatocyte$gene == "NR0B2"], 2)`,
+FDR `r fmt_p(de$Hepatocyte$padj[de$Hepatocyte$gene == "NR0B2"])`), alongside the
+depleted bile acid program. FXR signalling output is measurably lower in MASH
+hepatocytes in this cohort. Whether restoring it is beneficial is a clinical
+question this dataset cannot address, and the mixed clinical history of FXR
+agonism is a reminder that pathway restoration and patient benefit are different
+things.
+
+**PPAR-alpha (elafibranor, lanifibranor).** *PPARA* is well expressed in
+hepatocytes and unchanged in disease, and it sits inside `Hep-M6`, one of the
+hepatocyte modules that moves significantly. *PPARG* is macrophage-biased, and
+macrophages show the strongest cholesterol-homeostasis enrichment in the
+dataset, which is at least consistent with a lipid-handling role for the
+myeloid arm of a pan-PPAR agent. *PPARD* is poorly detected in every cell type
+here, so this dataset can say little about selective delta agonism.
+
+**Glucagon (survodutide's glucagon arm).** This one differs, and the distinction
+is worth drawing. *GCGR* is expressed in
+`r round(drug_expr$pct["GCGR", "Hepatocyte"], 1)`% of hepatocytes and is
+modestly reduced in MASH
+(log2FC `r round(de$Hepatocyte$log2FoldChange[de$Hepatocyte$gene == "GCGR"], 2)`,
+FDR `r fmt_p(de$Hepatocyte$padj[de$Hepatocyte$gene == "GCGR"])`). Unlike the
+GLP-1 and GIP components, the glucagon arm of a dual agonist has a direct
+hepatocyte target that is measurable in this tissue. That makes glucagon-containing
+dual agonists the incretin-class agents this dataset can actually say something
+about.
+
+### Targets whose liver action is not visible in this dataset
+
+**GLP-1 (semaglutide).** *GLP1R* is not present in the object at all. This is not
+a detection failure peculiar to this study: hepatocytes are not generally held to
+express GLP-1 receptor, and the hepatic benefit of GLP-1 agonism is understood to
+be largely indirect, through weight loss, glycaemic control and adipose
+signalling. The consequence is simply that a liver transcriptomic atlas is the
+wrong instrument for evaluating it. Its absence here is uninformative about the
+drug.
+
+**GIP (tirzepatide's GIP arm).** *GIPR* is effectively undetected in hepatocytes.
+The same reasoning applies.
+
+**FGF21 analogues.** The obligate co-receptor *KLB* is detected in only
+`r round(drug_expr$pct["KLB", "Hepatocyte"], 1)`% of hepatocytes, and *FGFR1* is
+essentially absent from hepatocytes while being present on stellate cells. FGF21
+biology is substantially adipose-directed, so a liver dataset again under-reports
+the mechanism.
+
+### Anti-fibrotic targets: this dataset cannot evaluate them
+
+```{r}
+#| label: antifibrotic-targets
+
+af <- c("LOX", "LOXL1", "LOXL2", "ITGB6", "ITGB1", "ITGAV", "TGFB1", "TGFBR1", "TGFBR2")
+af <- af[!af %in% drug_expr$absent]
+kable(data.frame(
+  Target = af,
+  `Highest in` = sapply(af, where),
+  `Mean expr` = round(sapply(af, look, "avg"), 2),
+  `% expressing` = round(sapply(af, look, "pct"), 1),
+  check.names = FALSE), row.names = FALSE,
+  caption = "Anti-fibrotic drug targets, at the cell type where each is highest.")
+```
+
+The lysyl oxidases are the clearest case. *LOX* is essentially undetected,
+*LOXL1* and *LOXL2* are detected in a few percent of stellate cells, and *LOXL2*
+does not change significantly with disease. *ITGB6*, the target of alpha-v-beta-6
+integrin inhibition, is effectively absent. *TGFB1* is low in every cell type,
+and the TGF-beta signalling program is not significantly enriched in stellate
+cells. Read naively, this would look like a dataset arguing against anti-fibrotic
+targets.
+
+That reading would be wrong, and the reason is documented earlier in this report.
+These drugs act on collagen-producing myofibroblasts, and this dataset does not
+contain them: the highest *COL1A1* count in any nucleus across the entire atlas
+is
+`r max(col1a1_counts())`, and the scar-associated
+endothelial and mesenchymal populations from the reference cirrhosis atlas both
+fail to appear while the scar-associated macrophage population replicates
+cleanly. The most likely explanation for all of it is that needle-core
+biopsy tissue does not recover cells resident in dense scar matrix.
+
+So the correct statement is not that this dataset provides weak support for
+anti-fibrotic mechanisms. It is that **this dataset cannot assess them**, because
+the cell population those drugs target is missing from it for reasons of tissue
+sampling rather than biology. An apparent absence of a drug target is only
+evidence when the cells that would express it were recoverable in the first
+place. The one anti-fibrotic-adjacent target that does move is *ITGAV* in
+stellate cells
+(log2FC `r round(de$Stellate_cell$log2FoldChange[de$Stellate_cell$gene == "ITGAV"], 2)`,
+FDR `r fmt_p(de$Stellate_cell$padj[de$Stellate_cell$gene == "ITGAV"])`), which is
+suggestive and no more.
+
+### Does the data support combination therapy?
+
+Not directly, and any dataset of this design would struggle to. What it does
+provide is a structural argument, which is weaker but not empty.
+
+The central result of this report is that MASH perturbation is distributed
+across cell types along two independent axes, and that the axes do not coincide.
+Hepatocytes lose a metabolic program and are depleted. Macrophages switch
+identity from resident Kupffer to scar-associated without much change in number.
+Endothelial cells carry the second-largest expression program in the dataset
+with no abundance change at all, and its content is inflammatory. Lymphocytes
+expand several-fold with comparatively little transcriptional change.
+
+A hepatocyte-directed metabolic agent, whether a thyromimetic, an incretin or a
+PPAR agonist, addresses the first of those compartments. Nothing in this data
+suggests it would directly reach the macrophage identity switch or the
+endothelial inflammatory program, both of which are large, statistically
+robust and confined to cell types the metabolic targets are not expressed in.
+That distribution is a reason to expect that a single-compartment intervention
+leaves a substantial part of the measured disease untouched.
+
+What this dataset cannot do is tell you which second agent to employ. Adjudicating a
+metabolic-plus-anti-fibrotic combination specifically would require measuring
+the fibrotic compartment, and this tissue preparation does not recover it (but at least we now know that). A
+study built on precision-cut liver slices (like the kind I've done in the past at Pliant), resections or explants, where
+myofibroblasts and the scar-resident niche are retained, is the design that
+could potentially answer the direct anti-fibrotic question.
+
+## Limitations
+
+**Compositional dependence.** Proportions sum to one, so the loss of half the
+hepatocyte compartment mechanically inflates every other fraction. The immune
+expansions are relative enrichments. Distinguishing that from absolute
+infiltration would require a cell-number-per-unit-tissue measurement that
+dissociation-based data cannot provide.
+
+**No batch variable.** The deposit carries no sequencing run, chemistry or
+processing-date column, so no technical covariate could be tested or adjusted
+for. The cohort is single-center, which limits the risk, but this cannot be
+verified from what was deposited.
+
+**Fibrosis is available only as a dichotomy.** The source study staged fibrosis
+on the full Brunt/Kleiner F0-F4 scale, but used it only to define the eMASH
+(F0-2) and aMASH (F3-4) groups, and the per-donor stage was not deposited. The
+metadata carries disease group and nothing else clinical: no fibrosis stage, no
+activity score, no ALT, and no age, sex or BMI. The finest fibrosis comparison
+possible here is therefore the two-bin eMASH-versus-aMASH contrast, on 9 and 10
+donors. No dose-response across F0 to F4 can be tested, and the stellate result
+above should be read with that in mind: it is a difference between two coarse
+fibrosis bins, not a gradient. The same constraint rules out relating cell-type
+proportions to clinical severity, which the source paper was able to do because
+it had the clinical table.
+
+**Label heterogeneity is a real constraint.** The stellate result demonstrates
+that pseudobulk over a mixed label can invert a program's apparent direction.
+The same risk applies in principle to every label used here. It was caught in
+this instance because the expected direction was known in advance and checked.
+
+**Controls are not healthy volunteers.** They are biopsies from people
+undergoing clinical procedures with no MASLD diagnosis. A baseline of stellate
+activation and immune presence is expected, and comparisons are against that
+baseline, not against normal liver.
+
+**Unequal and modest group sizes.** The stage-resolved contrasts rest on 6 to 10
+donors per arm. The eMASH-versus-aMASH stellate result does not survive
+multiple-testing correction and is reported as suggestive for that reason.
+
+**Reused integration and inherited annotation.** The analysis relies on the
+deposited Liger integration and cluster labels rather than re-deriving them. That is deliberate: the labels
+were validated against canonical markers before use, and re-clustering a
+published, already-integrated object risks recapitulating the original result
+rather than testing it. It does mean any error in the deposited annotation
+propagates here, as the stellate `inactivated` subcluster illustrates. That case
+also shows the check working: the mixture was detectable from marker expression,
+from unbiased enrichment and from the subcluster-level profile, without
+re-clustering anything.
+
+
+# Supplementary
+
+## Within-lineage resolution
+
+Two lineages subdivide in the deposited annotation, and both subdivide along an
+axis MASH acts on. This is where the detailed labels earn their place.
+
+```{r}
+#| label: detailed
+#| fig-width: 10
+#| fig-height: 3.6
+
+sub_frac <- function(prefix) {
+  s  <- md[grepl(prefix, md[[COL_CT_FINE]]), ]
+  tb <- table(s[[COL_DONOR]], s[[COL_CT_FINE]])
+  pr <- sweep(tb, 1, rowSums(tb), "/") * 100
+  st <- donors$stage[match(rownames(pr), donors$donor)]
+  data.frame(donor = rep(rownames(pr), ncol(pr)),
+             subtype = rep(colnames(pr), each = nrow(pr)),
+             pct = as.vector(pr), stage = rep(st, ncol(pr)))
+}
+
+st_frac  <- sub_frac("^Stellate")
+hep_frac <- sub_frac("^Hepatocyte")
+
+ggplot(rbind(st_frac, hep_frac), aes(stage, pct, fill = stage)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+  geom_jitter(width = 0.15, size = 0.6, alpha = 0.5) +
+  facet_wrap(~ subtype, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = c("#4C72B0", "#DD8452", "#C44E52", "#8172B3")) +
+  labs(x = NULL, y = "% of parent lineage") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+#| label: detailed-table
+sm <- function(d) round(sapply(levels(donors$stage), function(s)
+  tapply(d$pct[d$stage == s], d$subtype[d$stage == s], mean, na.rm = TRUE)), 1)
+kable(rbind(sm(st_frac), sm(hep_frac)),
+      caption = "Mean composition within each lineage (%), by stage.")
+```
+
+Hepatocyte zonation shifts consistently: the pericentral fraction rises across
+the progression while periportal and interzonal fractions fall. Given that
+hepatocytes are simultaneously halving in absolute proportion, this is a
+relative change in which zonal identity survives, not evidence that pericentral
+hepatocytes increase in number.
+
+The stellate substates move much less than their names suggest. The activated
+fraction is already
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_activated" & st_frac$stage == "No-MASLD"], na.rm = TRUE), 1)`%
+in controls and reaches only
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_activated" & st_frac$stage == "aMASH"], na.rm = TRUE), 1)`%
+in advanced MASH. The controls are liver biopsies from people undergoing
+clinical procedures rather than healthy volunteers, so a non-trivial baseline of
+stellate activation is plausible.
+
+The substate that does move sharply is `inactivated`, which falls from
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_inactivated" & st_frac$stage == "No-MASLD"], na.rm = TRUE), 1)`%
+to
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_inactivated" & st_frac$stage == "aMASH"], na.rm = TRUE), 1)`%.
+That turns out to matter more than the activated fraction, and it is taken up in
+detail below, after the enrichment results supply a second line of evidence
+about what that subcluster actually contains.
+
+How these substate labels were produced is relevant to reading them. The source
+paper's supplementary methods describe subclustering all donors together, then
+subclustering disease and control cells separately, and assigning a substate
+only where both analyses agreed. Cells that disagreed were labeled
+`Unidentified`, and subclusters showing ectopic marker expression were labeled
+`misc`. That is a conservative procedure, but it means the substate assignments
+are not independent of disease status, so substate proportions compared across
+disease groups should be read as descriptive rather than as a clean test.
+
+
+## Is this a technical gradient?
+
+Enrichment on pseudobulk is vulnerable to a specific failure: proliferation and
+biosynthesis sets are loaded with highly expressed housekeeping genes, so a
+systematic difference in capture depth between groups can produce a sweep of
+significant hits that reflect nothing biological. Three checks decide whether
+that is happening here.
+
+```{r}
+#| label: gsea-diagnostic
+
+sig <- subset(gs_all, padj < 0.05)
+spread <- aggregate(NES ~ pathway, sig, function(x) c(n = length(x), lo = min(x), hi = max(x)))
+spread <- data.frame(pathway = spread$pathway, n_types = spread$NES[, "n"],
+                     NES_min = round(spread$NES[, "lo"], 2),
+                     NES_max = round(spread$NES[, "hi"], 2))
+spread <- spread[order(-spread$n_types), ][1:6, ]
+
+pb_sel <- pbmeta$n_cells >= MIN_CELLS & !is.na(pbmeta$condition)
+depth  <- tapply(colSums(pb[, pbmeta$pseudosample[pb_sel]]) /
+                 pbmeta$n_cells[pb_sel], pbmeta$condition[pb_sel], median)
+
+kable(spread, row.names = FALSE,
+      caption = "Pathways significant in the most cell types, with the range of their enrichment scores.")
+```
+
+**The most widely significant pathways change sign between cell types.**
+`MYC_TARGETS_V1` runs from NES `r round(min(subset(sig, pathway == "MYC_TARGETS_V1")$NES), 2)`
+to `r round(max(subset(sig, pathway == "MYC_TARGETS_V1")$NES), 2)` depending on
+which cell type is examined. A depth artifact would push every cell type in the
+same direction.
+
+**Median counts per nucleus are comparable between groups**
+(`r round(depth[["Control"]])` in Control, `r round(depth[["MASH"]])` in MASH),
+and DESeq2 models library size explicitly in any case.
+
+**The leading-edge genes are process-specific, not housekeeping.** The strongest
+single result in the dataset is loss of `E2F_TARGETS` in NK cells, and its
+leading edge is *RRM2*, *MELK*, *BIRC5*, *MCM4*, *MCM6*, *ORC6*, *CENPE*:
+replication and mitotic machinery, with no ribosomal protein genes at all.
+
+The results are therefore read as biological.
+
+## Localizing the mixture to one subcluster
+
+The annotation section established that the subcluster labeled
+`Stellate_cell_inactivated` is vascular mural rather than stellate. This section
+works out what that mislabel does to the aggregate stellate results, which is
+where it matters.
+
+One point of context first. The source paper defines its *inactivated* state on
+*PDGFRB*, *TAGLN*, *ACTA2* and *PPARG*, so *ACTA2* and *TAGLN* are markers of
+that state rather than of activation. Loss of those genes from the stellate
+compartment therefore has two candidate explanations, mural contamination or
+genuine loss of an inactivated stellate population, and they are separable
+because they predict different behavior from smooth-muscle genes that appear in
+neither panel.
+
+```{r}
+#| label: stellate-subtypes
+
+sub_expr <- cached("stellate_subtype_expr.rds", {
+  library(BPCells)
+  mat  <- open_matrix_dir("bpcells_counts")
+  meta <- readRDS(cache_path("meta.rds"))
+  sel  <- grepl("^Stellate", meta[[COL_CT_FINE]])
+  ctf  <- factor(as.character(meta[[COL_CT_FINE]])[sel])
+  sb   <- mat[, which(sel)]
+  nm   <- log1p(multiply_cols(sb, 1e4 / colSums(sb)))
+  g <- c("DCN", "RBP1", "LRAT", "CYGB", "HGF", "COL1A1", "COL1A2",
+         "PDGFRB", "TAGLN", "ACTA2", "PPARG",
+         "MYH11", "MYLK", "MYL9", "NOTCH3", "RGS5")
+  g <- g[g %in% rownames(mat)]
+  t(pseudobulk_matrix(nm[g, ], cell_groups = ctf, method = "mean"))
+})
+
+rownames(sub_expr) <- sub("Stellate_cell_", "", rownames(sub_expr))
+kable(round(sub_expr[, c("LRAT", "DCN", "RBP1", "COL1A1",
+                         "ACTA2", "TAGLN", "PDGFRB",
+                         "MYH11", "NOTCH3", "RGS5")], 2),
+      caption = "Mean log-normalized expression by stellate subcluster. Left block: hepatic stellate identity. Middle: the paper's inactivated-state panel. Right: smooth-muscle and pericyte genes used by neither panel.")
+```
+
+The inactivated subcluster carries
+`r round(sub_expr["inactivated", "MYH11"] / max(sub_expr[rownames(sub_expr) != "inactivated", "MYH11"]))`-fold
+more *MYH11* than any other stellate subcluster, along with the only appreciable
+*NOTCH3*, while showing the **lowest** *LRAT* and *DCN* of the four.
+
+That combination decides the question. *MYH11* is smooth-muscle myosin heavy
+chain and is not expressed by hepatic stellate cells in any activation state. A
+genuinely inactivated stellate cell, one that has reverted after activation,
+retains its lipid-storing identity markers; this population has the least *LRAT*
+and *DCN* of any subcluster while uniquely expressing *MYH11* and *NOTCH3*. It
+is better described as vascular smooth muscle or pericyte than as a stellate
+cell of any state.
+
+That mural population also declines across the progression, falling from
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_inactivated" & st_frac$stage == "No-MASLD"], na.rm = TRUE), 1)`%
+to
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_inactivated" & st_frac$stage == "aMASH"], na.rm = TRUE), 1)`%
+of the compartment, which is the right shape to inflate an apparent loss of
+contractile genes when the whole label is aggregated.
+
+### How much of the effect is composition?
+
+The tempting conclusion is that the entire contractile signal is a mixture
+artifact. That is testable in two ways, and the test does not fully support it.
+
+```{r}
+#| label: stellate-decompose
+
+# 1. Rebuild the stellate pseudobulk with the mural subcluster removed.
+# 2. Test inside single subtypes, where composition is fixed by construction and
+#    any remaining change must be a within-cell-type effect.
+decomp <- cached("stellate_decompose.rds", {
+  library(BPCells); library(DESeq2)
+  meta <- readRDS(cache_path("meta.rds")); mt <- open_matrix_dir("bpcells_counts")
+  dn <- unique(meta[, c(COL_DONOR, COL_STAGE)])
+  cnd <- setNames(unname(CONDITION_MAP[dn[[COL_STAGE]]]), dn[[COL_DONOR]])
+
+  de_on <- function(subtypes) {
+    sel <- meta[[COL_CT_FINE]] %in% subtypes
+    grp <- paste0("g__", meta[[COL_DONOR]][sel])
+    p <- pseudobulk_matrix(mt[, which(sel)], cell_groups = grp, method = "sum")
+    n <- table(grp)[colnames(p)]; dono <- sub("g__", "", colnames(p))
+    keep <- n >= MIN_CELLS & !is.na(cnd[dono])
+    cts <- round(p[, keep, drop = FALSE]); mode(cts) <- "integer"
+    cts <- cts[rowSums(cts > 0) >= ceiling(ncol(cts) / 3), , drop = FALSE]
+    cd <- data.frame(condition = factor(cnd[dono[keep]], levels = CONDITION_LEVELS),
+                     row.names = colnames(cts))
+    dds <- DESeq(DESeqDataSetFromMatrix(cts, cd, ~ condition), quiet = TRUE)
+    r <- as.data.frame(results(dds, contrast = c("condition", "MASH", "Control")))
+    r$gene <- rownames(r); r$n_control <- sum(cd$condition == "Control")
+    r$n_mash <- sum(cd$condition == "MASH"); r
+  }
+  list(
+    hsc_only  = de_on(c("Stellate_cell_quiescent", "Stellate_cell_activated",
+                        "Stellate_cell_misc")),
+    quiescent = de_on("Stellate_cell_quiescent"),
+    activated = de_on("Stellate_cell_activated"))
+})
+
+pull <- function(r, g) {
+  i <- match(g, r$gene)
+  sprintf("%+.2f%s", r$log2FoldChange[i],
+          ifelse(is_de(r)[i], "*", ""))
+}
+gg <- c("TAGLN", "ACTA2", "MYH11", "MYL9", "LRAT", "COL1A1", "COL3A1")
+kable(data.frame(
+  Gene = gg,
+  `All stellate` = pull(de$Stellate_cell, gg),
+  `Mural removed` = pull(decomp$hsc_only, gg),
+  `Quiescent only` = pull(decomp$quiescent, gg),
+  `Activated only` = pull(decomp$activated, gg),
+  check.names = FALSE), row.names = FALSE,
+  caption = paste0("log2 fold change, MASH vs Control, as the mural subcluster is ",
+                   "removed and then as the test is confined within single subtypes. * = ", DE_RULE, "."))
+```
+
+The two contractile genes behave differently, and the distinction matters.
+
+*MYH11* loses significance as soon as the mural subcluster is removed and stays
+non-significant inside both subtypes. That is what a pure composition effect
+looks like, and it confirms the mural reading.
+
+*TAGLN* does not. It remains strongly depleted inside the quiescent subcluster
+and inside the activated subcluster, tested separately, where composition is
+fixed by construction and cannot contribute. That is a real transcriptional
+change within hepatic stellate cells.
+
+So both mechanisms are operating, and an earlier reading of this result as
+purely a mixture artifact would have been wrong. A mural population is inflating
+the aggregate signal, which is why `MYOGENESIS` weakens from
+`r round(subset(gs_all, cell_type == "Stellate_cell" & pathway == "MYOGENESIS")$NES, 2)`
+to non-significance once those cells are excluded. Underneath it there is a
+genuine, subtype-independent downregulation of *TAGLN* in stellate cells. What
+the data do not support is the simple statement that stellate cells are losing
+their activation program wholesale: *LRAT* rises rather than falls, and the
+fibrillar collagens do not move significantly in either direction. That last
+point should not be read as evidence against fibrogenesis either: as quantified
+in the limitations, this dataset contains no collagen-producing myofibroblast
+population to detect a change in.
+
+This remains a caution about the deposited annotation, and it is only visible
+because the deposit ships substate labels alongside the broad ones. It is also a
+concrete illustration of the general hazard, with the qualification that
+decomposing the effect matters: pseudobulk over a mixed label can exaggerate a
+program, and separating composition from within-cell-type change requires
+testing at a level where composition cannot vary.
+
+## Comparison with the source paper's own enrichment
+
+The source paper ran its own enrichment on the same tissue, reported in its
+Supplementary Table 3. Comparing against it tests whether the pathway-level
+conclusions here depend on the analytical choices made in this report.
+
+Four differences matter when reading the comparison. Their differential
+expression was cell-level Seurat `FindMarkers`, against donor-level pseudobulk
+here. Their enrichment was over-representation testing with enrichR on
+thresholded gene lists, against GSEA on the full ranking here. Their gene sets
+were GO Biological Process, against Hallmark here, and the two collections do
+not map one-to-one. And their comparison pooled MASL into the reference group as
+"nonMASH", where the primary contrast here holds MASL out. Their table also
+reports only the top four terms in each direction, so a term missing from it is
+not evidence that they found nothing.
+
+```{r}
+#| label: paper-comparison
+
+# Terms as reported in Hong et al. Supplementary Table 3 (GO Biological Process,
+# enrichR, MASH vs nonMASH). Quoted here as reference values; every value in the
+# "this report" columns is computed from the GSEA above.
+paper <- data.frame(
+  cell_type = c("Hepatocyte", "Hepatocyte", "Hepatocyte", "Hepatocyte",
+                "Cholangiocyte", "Cholangiocyte", "Cholangiocyte",
+                "Stellate_cell", "Stellate_cell",
+                "Endothelial_cell", "Endothelial_cell"),
+  paper_term = c("cholesterol biosynthetic process", "steroid metabolic process",
+                 "drug catabolic process", "cellular amino acid catabolic process",
+                 "mitochondrial electron transport", "Notch signaling pathway",
+                 "regulation of canonical Wnt signaling",
+                 "muscle contraction", "collagen fibril organization",
+                 "cellular response to interferon-gamma",
+                 "positive regulation of cell migration"),
+  paper_dir = c("up", "down", "down", "down",
+                "down", "up", "up",
+                "down", "up",
+                "down", "up"),
+  hallmark = c("CHOLESTEROL_HOMEOSTASIS", "BILE_ACID_METABOLISM",
+               "XENOBIOTIC_METABOLISM", "FATTY_ACID_METABOLISM",
+               "OXIDATIVE_PHOSPHORYLATION", "NOTCH_SIGNALING",
+               "WNT_BETA_CATENIN_SIGNALING",
+               "MYOGENESIS", "EPITHELIAL_MESENCHYMAL_TRANSITION",
+               "INTERFERON_GAMMA_RESPONSE", "EPITHELIAL_MESENCHYMAL_TRANSITION"),
+  stringsAsFactors = FALSE)
+
+lookup <- function(ct, pw, field) {
+  r <- gs_all[gs_all$cell_type == ct & gs_all$pathway == pw, ]
+  if (!nrow(r)) return(NA_real_)
+  r[[field]][1]
+}
+paper$NES <- mapply(lookup, paper$cell_type, paper$hallmark, "NES")
+paper$FDR <- mapply(lookup, paper$cell_type, paper$hallmark, "padj")
+paper$this_dir <- ifelse(is.na(paper$NES), NA,
+                  ifelse(paper$FDR >= 0.05, "n.s.",
+                  ifelse(paper$NES > 0, "up", "down")))
+paper$agrees <- ifelse(paper$this_dir == "n.s.", "not significant",
+                ifelse(paper$this_dir == paper$paper_dir, "agrees", "opposite"))
+
+kable(data.frame(
+  `Cell type` = paper$cell_type,
+  `Paper GO term` = paper$paper_term,
+  `Paper` = paper$paper_dir,
+  `Matched Hallmark set` = paper$hallmark,
+  `NES` = round(paper$NES, 2),
+  `FDR` = signif(paper$FDR, 2),
+  `Verdict` = paper$agrees,
+  check.names = FALSE), row.names = FALSE,
+  caption = "Terms reported in Hong et al. Supplementary Table 3, against the nearest Hallmark set in this analysis.")
+```
+
+**Hepatocyte metabolic reprogramming replicates completely.** All four reported
+directions agree: cholesterol handling up, and steroid, drug-catabolic and
+fatty-acid metabolism down. Two methods that share nothing except the underlying
+tissue reach the same conclusion, which is the strongest form of corroboration
+available here.
+
+**Their table contains the stellate result independently.** Supplementary Table 3
+reports *muscle contraction* as significantly depleted in stellate cells in
+MASH. That is the same signal as the `MYOGENESIS` depletion above
+(NES `r round(subset(gs_all, cell_type == "Stellate_cell" & pathway == "MYOGENESIS")$NES, 2)`),
+recovered from different data processing, a different differential expression
+method and a different gene set collection.
+
+This matters for how the mural-cell interpretation should be read. The
+observation is not particular to this pipeline: it is present in the source
+paper's own supplementary results, where it is reported without interpretation.
+What this report adds is the explanation, that the depletion reflects loss of a
+mural population carried inside the stellate label rather than a change in
+stellate contractile state.
+
+### Where the two analyses diverge
+
+```{r}
+#| label: paper-grouping
+
+# Their reference group pools MASL with controls. Rerunning the four cell types
+# their table covers under that definition separates disagreements caused by the
+# grouping from disagreements caused by method.
+gsea_pooled <- cached("gsea_pooled.rds", {
+  library(fgsea); library(msigdbr)
+  hall <- msigdbr(species = "Homo sapiens", collection = "H")
+  sets <- split(hall$gene_symbol, hall$gs_name)
+  names(sets) <- sub("^HALLMARK_", "", names(sets))
+  pm <- pbmeta
+  pm$grp <- ifelse(pm$stage %in% c("No-MASLD", "MASL"), "nonMASH",
+            ifelse(pm$stage %in% c("eMASH", "aMASH"), "MASH", NA))
+  out <- list()
+  for (ct in c("Hepatocyte", "Cholangiocyte", "Stellate_cell", "Endothelial_cell")) {
+    sel <- pm$cell_type == ct & pm$n_cells >= MIN_CELLS & !is.na(pm$grp)
+    m <- pm[sel, ]; m$grp <- factor(m$grp, levels = c("nonMASH", "MASH"))
+    cts <- round(pb[, m$pseudosample, drop = FALSE]); mode(cts) <- "integer"
+    cts <- cts[rowSums(cts > 0) >= ceiling(ncol(cts) / 3), , drop = FALSE]
+    dds <- DESeq(DESeqDataSetFromMatrix(cts, m, ~ grp), quiet = TRUE)
+    r <- as.data.frame(results(dds, contrast = c("grp", "MASH", "nonMASH")))
+    r$gene <- rownames(r); r <- r[!is.na(r$stat), ]
+    st <- setNames(r$stat, r$gene); st <- st[!duplicated(names(st))]
+    set.seed(42)
+    out[[ct]] <- as.data.frame(fgsea(sets, st, minSize = 10, maxSize = 500,
+                                     nPermSimple = 10000))
+  }
+  out
+})
+
+pooled_get <- function(ct, pw) {
+  r <- gsea_pooled[[ct]][gsea_pooled[[ct]]$pathway == pw, ]
+  if (!nrow(r)) return(c(NA, NA))
+  c(r$NES[1], r$padj[1])
+}
+diverge <- data.frame(
+  `Cell type` = c("Stellate_cell", "Endothelial_cell", "Cholangiocyte", "Cholangiocyte"),
+  `Hallmark set` = c("EPITHELIAL_MESENCHYMAL_TRANSITION", "INTERFERON_GAMMA_RESPONSE",
+                     "NOTCH_SIGNALING", "WNT_BETA_CATENIN_SIGNALING"),
+  check.names = FALSE)
+mine <- t(mapply(function(ct, pw) c(lookup(ct, pw, "NES"), lookup(ct, pw, "padj")),
+                 diverge$`Cell type`, diverge$`Hallmark set`))
+pool <- t(mapply(pooled_get, diverge$`Cell type`, diverge$`Hallmark set`))
+diverge$`NES (MASL held out)`   <- round(mine[, 1], 2)
+diverge$`FDR (held out)`        <- signif(mine[, 2], 2)
+diverge$`NES (MASL pooled in)`  <- round(pool[, 1], 2)
+diverge$`FDR (pooled in)`       <- signif(pool[, 2], 2)
+kable(diverge, row.names = FALSE,
+      caption = "The four disagreements, evaluated under both reference-group definitions.")
+```
+
+**One disagreement is entirely explained by the grouping.** The paper reports
+collagen fibril organization up in stellate cells. Holding MASL out, the nearest
+Hallmark set is not significant; pooling MASL into the reference as they did, it
+becomes significantly up. The reason is visible in the composition data above:
+MASL donors carry an unusually quiescent stellate compartment
+(`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_quiescent" & st_frac$stage == "MASL"], na.rm = TRUE))`%
+quiescent, against
+`r round(mean(st_frac$pct[st_frac$subtype == "Stellate_cell_quiescent" & st_frac$stage == "No-MASLD"], na.rm = TRUE))`%
+in controls), so folding them into the reference lowers its fibrogenic baseline
+and widens the contrast. Both results are defensible; they answer slightly
+different questions, and the fibrogenesis signal is worth knowing is sensitive
+to that choice.
+
+**One disagreement is not.** The paper reports the interferon-gamma response
+down in endothelial cells; here it is up, under both reference definitions. The
+leading edge is *VCAM1*, *CD274*, *IDO1*, *FAS* and *IL18BP*, which are
+interferon-inducible endothelial activation genes, and *VCAM1* induction is
+consistent with the leukocyte recruitment implied by the abundance results. The
+direction is also coherent across the tissue: interferon-gamma response is up in
+the structural compartments and down in every immune population tested. The most
+likely source of the discrepancy is that Hallmark's response signature is broad
+where the GO term is a narrower signalling set, compounded by cell-level versus
+donor-level differential expression. This is flagged rather than resolved.
+
+**Two of their findings are not reproduced.** Notch and Wnt signalling in
+cholangiocytes are not significant here under either grouping. Cholangiocytes
+are the least powered cell type in this analysis, with the fewest donors
+clearing the pseudo-sample threshold, so this is weak evidence against their
+result. Their Notch claim also rests primarily on cell-cell interaction
+analysis, which is not attempted here.
+
+
+```{r}
+#| label: session
+#| code-fold: true
+sessionInfo()
+```
